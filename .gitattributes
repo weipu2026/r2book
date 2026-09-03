@@ -1,0 +1,4 @@
+# 统一 LF：bash 脚本和 Worker 源码不兼容 CRLF
+* text=auto eol=lf
+*.png binary
+*.svg text

@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>私人书库</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<div id="login" class="login-mask">
+  <form id="login-form" class="login-box">
+    <h1>私人书库</h1>
+    <input type="password" id="login-pwd" placeholder="管理口令" autocomplete="current-password" autofocus>
+    <button type="submit">进入</button>
+    <p id="login-err" class="login-err"></p>
+  </form>
+</div>
+
+<div id="app" hidden>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-name" id="site-name">私人书库</span>
+    </div>
+    <div class="quota">
+      <div class="quota-bar"><div class="quota-fill" id="quota-fill"></div></div>
+      <span class="quota-text" id="quota-text">—</span>
+    </div>
+    <div class="topbar-actions">
+      <button class="btn ghost" id="btn-rebuild">重建索引</button>
+      <button class="btn ghost" id="btn-logout">登出</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <aside class="sidebar">
+      <div class="side-head">
+        <h2>分类</h2>
+        <button class="btn tiny" id="btn-new-cat">新建</button>
+      </div>
+      <ul class="cat-list" id="cat-list"></ul>
+    </aside>
+
+    <section class="content">
+      <div class="dropzone" id="dropzone">
+        <p class="dz-main">把小说拖到这里，或 <button class="link" id="btn-pick">选择文件</button></p>
+        <p class="dz-sub" id="dz-target">上传目标：请先在左侧选一个分类</p>
+        <label class="dz-opt"><input type="checkbox" id="opt-clean" checked> 自动清洗书名（剥掉【www.xxx.com】之类广告后缀）</label>
+        <input type="file" id="file-input" multiple accept=".txt,.text,.epub,.pdf,.mobi,.azw3,.zip,.md" hidden>
+      </div>
+
+      <div class="queue" id="queue" hidden></div>
+
+      <div class="list-head">
+        <h2 id="list-title">全部书目</h2>
+        <div class="list-tools">
+          <input type="search" id="search" placeholder="筛选书名">
+          <span class="count" id="list-count"></span>
+        </div>
+      </div>
+
+      <div class="batch-bar" id="batch-bar" hidden>
+        <span id="batch-count">已选 0 本</span>
+        <button class="btn tiny" id="btn-batch-move">移动到…</button>
+        <button class="btn tiny danger" id="btn-batch-del">批量删除</button>
+        <button class="btn tiny ghost" id="btn-batch-cancel">取消选择</button>
+      </div>
+
+      <div class="table-wrap">
+        <table class="book-table">
+          <thead>
+            <tr><th class="col-ck"><input type="checkbox" id="ck-all" title="全选本页"></th><th>书名</th><th class="col-cat">分类</th><th class="col-size">大小</th><th class="col-time">上传</th><th class="col-op"></th></tr>
+          </thead>
+          <tbody id="book-body"></tbody>
+        </table>
+        <p class="empty" id="empty-tip" hidden>这个分类还没有书</p>
+      </div>
+
+      <div class="pager" id="pager" hidden>
+        <button class="btn tiny" id="page-prev">上一页</button>
+        <span id="page-info"></span>
+        <button class="btn tiny" id="page-next">下一页</button>
+      </div>
+
+      <details class="trash-box">
+        <summary>回收站 <span id="trash-count"></span></summary>
+        <div class="trash-body" id="trash-body">加载中…</div>
+      </details>
+    </section>
+  </main>
+</div>
+
+<div id="toast" class="toast" hidden></div>
+
+<div id="modal" class="modal-mask" hidden>
+  <div class="modal">
+    <h3 id="modal-title">移动书目</h3>
+    <div class="modal-cats" id="modal-cats"></div>
+    <label class="modal-rename" id="modal-rename-row" hidden>新文件名 <input id="modal-name"></label>
+    <p class="modal-err" id="modal-err"></p>
+    <div class="modal-actions">
+      <button class="btn ghost" id="modal-cancel">取消</button>
+      <button class="btn primary" id="modal-ok">确定</button>
+    </div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

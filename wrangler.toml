@@ -1,0 +1,55 @@
+#:schema node_modules/wrangler/config-schema.json
+name = "r2book"
+main = "src/worker.js"
+compatibility_date = "2026-08-01"
+
+# 静态资源：上传端页面（index.html / app.js / style.css）
+#
+# 静态资源由 Cloudflare 边缘直接服务，不执行 Worker，也不消耗 Workers 请求数。
+# 只有 run_worker_first 列出的路径才会先跑 Worker：
+#   /          浏览器访问 → 上传端页面；Readingo 发 PROPFIND → WebDAV 根列表
+#   /books/*   书库只读出口（PROPFIND / GET / HEAD）
+#   /backup/*  Readingo 进度备份通道（PUT/MKCOL/DELETE，唯一可写区）
+#   /opds/*    OPDS 目录（Atom feed + OpenSearch）
+#   /api/*     上传端管理接口
+# 其余路径（/app.js、/style.css 等）走 assets 直出，零 Workers 消耗。
+[assets]
+directory = "./public"
+binding = "ASSETS"
+run_worker_first = ["/", "/books/*", "/backup/*", "/opds/*", "/api/*"]
+
+# 自定义域（可选）：
+#   GitHub Actions 部署 → 域名写在 GitHub Secret CUSTOM_DOMAIN 里，部署时自动注入，仓库里不留任何域名
+#   本地命令行部署     → 取消下面三行注释并填你的域名（要求托管在同一个 Cloudflare 账号下）
+# 不配置则使用默认的 https://r2book.<你的 workers.dev 子域>.workers.dev
+# [[routes]]
+# pattern = "your-domain.example.com"
+# custom_domain = true
+
+# R2：书库正文 + 分类级分片元数据
+#
+# bucket_name 建议用随机串，不跟域名绑死。这个值不是凭据（不像 KV namespace id），
+# 但用随机串可以避免被枚举。真实凭据（ADMIN_PASSWORD / SESSION_SECRET / DAV_PASSWORD）
+# 一律走 wrangler secret，绝不写进这里。
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "r2book-7f3a"
+
+[vars]
+SITE_NAME = "私人书库"
+# 登录态有效期（天）
+SESSION_DAYS = "30"
+# 单文件上传上限（字节）。Workers 请求体上限 100MB，小说 txt 一般 1-10MB，
+# 留到 50MB 足够；超过的请求在 Worker 里被拒，不浪费 R2 写入。
+MAX_UPLOAD = "52428800"
+# /backup/ 备份区单文件上限（字节）。Readingo 的进度备份只是几个 JSON，
+# 5MB 绰绰有余，卡小一点防止这个唯一可写区被塞爆 10GB。
+BACKUP_MAX = "5242880"
+
+# 以下敏感值用 wrangler secret put 设置，本地开发放 .dev.vars：
+#   ADMIN_PASSWORD   上传端登录口令
+#   SESSION_SECRET   Cookie 的 HMAC 签名密钥（随便一段长随机串）
+#   DAV_PASSWORD     Readingo 用的只读口令（可选，留空则回退到 ADMIN_PASSWORD）
+#
+# 建议 DAV_PASSWORD 与 ADMIN_PASSWORD 设成不同值：
+# 手机里保存的是 DAV_PASSWORD，即便手机丢失也不会被人删库。

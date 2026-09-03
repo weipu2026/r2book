@@ -1,0 +1,11 @@
+# 本地开发用。复制为 .dev.vars（已被 .gitignore 排除），生产环境用 wrangler secret put 设置。
+
+# 上传端登录口令
+ADMIN_PASSWORD=change-me
+
+# Cookie 的 HMAC 签名密钥，任意长随机串即可
+SESSION_SECRET=please-generate-a-long-random-string
+
+# Readingo 用的只读口令。建议与管理口令不同：手机里保存的是这一条，
+# 万一手机丢失，对方也只能看书，删不了库。留空则回退到 ADMIN_PASSWORD
+DAV_PASSWORD=reading-only-password

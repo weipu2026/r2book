@@ -1,0 +1,88 @@
+# 一键部署：把密钥填进 GitHub Secrets 后，push 到 main 或手动 Run workflow 即可。
+#
+# 必需的 Secrets：
+#   CLOUDFLARE_API_TOKEN   API Token（权限见 README「GitHub Actions 部署」一节）
+#   CLOUDFLARE_ACCOUNT_ID  Cloudflare 账户 ID（dashboard 右侧栏）
+#   ADMIN_PASSWORD         上传端登录口令
+#   SESSION_SECRET         Cookie 的 HMAC 签名密钥（openssl rand -hex 32 生成）
+#   DAV_PASSWORD           Readingo 只读口令（可选；留空则回退 ADMIN_PASSWORD）
+#   CUSTOM_DOMAIN          自定义域名（可选；留空则用默认 workers.dev 地址）
+#
+# 仓库本身零敏感信息：没有域名、没有凭据。
+
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-r2book
+  cancel-in-progress: true
+
+env:
+  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: 安装依赖
+        run: npm ci --no-audit --no-fund
+
+      - name: 语法检查
+        run: npm run check
+
+      # 幂等：桶已存在时报错没关系，继续往下走
+      - name: 确保 R2 桶存在
+        run: npx wrangler r2 bucket create r2book-7f3a || echo "bucket 已存在，跳过"
+
+      # 域名不进仓库：CUSTOM_DOMAIN Secret 非空时注入到 checkout 出来的
+      # wrangler.toml 副本末尾（[[routes]] 是显式表头，追加在文件末尾合法且
+      # 会切换上下文，不受前面 [vars] 影响）；为空则用默认 workers.dev 地址
+      - name: 注入自定义域名
+        run: |
+          if [ -z "${{ secrets.CUSTOM_DOMAIN }}" ]; then
+            echo "· 跳过域名绑定（CUSTOM_DOMAIN 未设置），使用默认 workers.dev 地址"
+            exit 0
+          fi
+          printf '\n[[routes]]\npattern = "%s"\ncustom_domain = true\n' \
+            "${{ secrets.CUSTOM_DOMAIN }}" >> wrangler.toml
+          echo "已绑定域名（域名值不打印到日志）"
+
+      # 先部署代码（保证 Worker 存在，secret put 才有目标），
+      # 再同步密钥——secrets 设置后立即生效，不需要再部署一次
+      - name: 部署 Worker
+        run: npx wrangler deploy
+
+      - name: 同步密钥到 Worker
+        run: |
+          set -e
+          put() {
+            local name="$1" val="$2"
+            if [ -z "$val" ]; then
+              echo "· 跳过 $name（GitHub Secrets 未设置）"
+              return 0
+            fi
+            printf '%s' "$val" | npx wrangler secret put "$name"
+            echo "· $name 已更新"
+          }
+          put ADMIN_PASSWORD "${{ secrets.ADMIN_PASSWORD }}"
+          put SESSION_SECRET "${{ secrets.SESSION_SECRET }}"
+          put DAV_PASSWORD "${{ secrets.DAV_PASSWORD }}"
+
+      - name: 部署完成
+        run: |
+          echo "✅ r2book 已部署"
+          echo "   书库 WebDAV: https://<你的域名>/"
+          echo "   进度备份   : https://<你的域名>/backup/"
+          echo "   OPDS       : https://<你的域名>/opds/"
+          echo "   域名绑定失败的话，检查 wrangler.toml 的 routes 是否是你在 Cloudflare 托管的域名"

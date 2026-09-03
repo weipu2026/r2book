@@ -1,0 +1,15 @@
+{
+  "name": "r2book",
+  "version": "1.0.0",
+  "private": true,
+  "description": "私人书库：Cloudflare Worker + R2，WebDAV 只读 + OPDS + 零构建上传端，运行在 Workers 免费额度内",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "check": "node --check src/worker.js && node --check public/app.js && echo OK"
+  },
+  "devDependencies": {
+    "wrangler": "^4.127.1"
+  }
+}
