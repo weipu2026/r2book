@@ -43,13 +43,14 @@ _trash/<ts>/<file>       软删除暂存
 | `DAV_PASSWORD` | 另一口令 | Readingo 只读口令，**与管理口令不同值** |
 | `CUSTOM_DOMAIN` | 你的域名 | 可选；**留空则用默认的 workers.dev 地址**。域名只存在 Secrets 里，仓库零痕迹，换域名不用改代码 |
 
-**API Token 权限**（Cloudflare dashboard → My Profile → API Tokens → 创建，用「编辑 Cloudflare Workers」模板打底再加两条）：
+**API Token 权限**（Cloudflare dashboard → My Profile → API Tokens → 创建，用「编辑 Cloudflare Workers」模板打底再按需加）：
 
-- Account · Workers Scripts · **Edit**（模板自带）
+- Account · Workers Scripts · **Edit**（模板自带，部署 Worker）
 - Account · Account Settings · **Read**（模板自带）
-- Zone · Zone · **Read**（模板自带，绑定自定义域名要用）
-- Account · Workers R2 Storage · **Edit**（模板外的必加项，建桶/读写书库）
-- Zone · DNS · **Edit**（模板外的必加项，`custom_domain` 自动建 DNS 记录和证书时要用；不绑自定义域名可省）
+- Account · Workers R2 Storage · **Edit**（建桶/读写书库；**较新的模板已自带**，若你的模板没有再手动加）
+- Zone · DNS · **Edit**（**绑自定义域名时才加**，`custom_domain` 自动建 DNS 记录用；用默认 workers.dev 地址可省）
+
+> 不用单独加 `Zone · Zone · Read`——绑域名时 `DNS · Edit`（在指定 Zone 上）已足够。模板不带任何 Zone 级权限。
 
 Workflow 做的事：语法检查 → 确保 R2 桶存在（幂等）→ 把 `CUSTOM_DOMAIN` 注入部署配置 → 部署 Worker → 把三个密码类 Secret 同步到 Worker（secrets 设置后立即生效，无需二次部署）。全部可重复执行，push 到 `main` 就是日常发布。
 
