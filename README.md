@@ -137,7 +137,7 @@ iOS 1.51+ 另有 OPDS 入口，地址填 `https://你的域名/opds/`。分类�
 - **静态资源走 `[assets]`**，`index.html` / `app.js` / `style.css` 由边缘直出，不消耗 Workers 请求数。只有 `/`、`/books/*`、`/opds/*`、`/api/*` 会执行 Worker（见 `wrangler.toml` 的 `run_worker_first`）
 - **拒绝 `Depth: infinity`**，返回 RFC 4918 允许的 403 + `propfind-finite-depth-lock`，强制客户端逐层列目录
 - **`/books/` 只读、`/backup/` 可写**是两套 Allow：书库不存在被 DAV 客户端改写的可能；备份区有单文件 5MB（`BACKUP_MAX`）+ 条目 300 双重防护
-- **批量接口分批上限**：`/api/batch-delete` 单次 5 项（每本约 8 次 subrequest，5×8=40）、`/api/move` 单次 3 项（每本约 14 次，3×14=42）——Workers Free 单次调用 50 次 subrequest 是硬上限，前端自动按对应数量分批
+- **批量接口分批上限**：`/api/batch-delete` 单次 4 项（每本约 8 次 subrequest，4×8=32，留 CAS 冲突余量）、`/api/move` 单次 3 项（每本约 14 次，3×14=42）——Workers Free 单次调用 50 次 subrequest 是硬上限，前端自动按对应数量分批
 - **元数据读写带乐观锁**：`updateMeta()` 用 R2 的 `onlyIf: { etagMatches }` 检测冲突并重试三次，避免并发上传时「读—改—写」静默丢更新
 - **GET 支持 Range**，Content-Range 的总长度从分片元数据取，省掉一次额外的 head 请求
 - **列表统一排序**：WebDAV / OPDS / 管理页共用 `Intl.Collator('zh', { numeric: true })` 按书名升序（中文按拼音、数字按数值），三类视图书序一致
@@ -151,6 +151,10 @@ iOS 1.51+ 另有 OPDS 入口，地址填 `https://你的域名/opds/`。分类�
 - **上传回滚**：写正文成功但索引写失败时，新增场景自动删除刚写的对象；覆盖场景保留对象并提示重建索引（旧版已覆盖不可找回）
 - **OPDS 搜索 CPU 预算**：搜索解析最多 20 个分类 / 累计 10000 本（约 8ms），超出即止，不顶 10ms CPU 硬限；分类超过 20 个时搜索不全，属可接受的取舍
 - **重建索引页数**：单分类最多读 45 页（45000 本），超出明确报错而非写截断索引
+- **HMAC 密钥缓存**：`importKey` 按 secret 复用 `CryptoKey`，鉴权路径 CPU 降约 40%
+- **流式搬运**：软删/移动/恢复用 `src.body` 管道传给 R2，不整体读入内存，单本上限不受 128MB isolate 内存约束
+- **冗余数据不重试**：`syncCatToRoot` 只 1 次 CAS（root.json 是聚合缓存，冲突即放弃、下次操作自愈），把 subrequest 预算让给关键写入
+- **OPDS feed 时间**：`<updated>` 取自分类书目的 max mtime（非请求时刻），客户端不会误判每次都有更新
 
 ## 免费额度核算
 

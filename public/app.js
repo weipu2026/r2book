@@ -5,6 +5,10 @@ const S = { cats: [], cur: 'all', books: [], totalBytes: 0, q: '', page: 1, page
 
 const QUOTA_BYTES = 10 * 1024 * 1024 * 1024;
 
+/* 与服务端 sortBooks 同序：书名升序（中文拼音、数字按数值），「全部」视图也按此排序 */
+const zhCollator = new Intl.Collator('zh', { numeric: true, sensitivity: 'base' });
+const cmpBooks = (a, b) => zhCollator.compare(String(a.title || a.file), String(b.title || b.file));
+
 /* ---------------- 工具 ---------------- */
 
 function fmtSize(n) {
@@ -179,9 +183,9 @@ function renderBooks() {
 
 /* ---------------- 批量操作 ---------------- */
 
-/* 批次大小：删除每本约 8 次 subrequest（5×8=40 < 50）；
- * 移动每本约 14 次（5×14=70 必爆），服务端上限 3，前端按 3 分批 */
-const BATCH_CHUNK_DEL = 5;
+/* 批次大小：删除每本约 8 次 subrequest（4×8=32 < 50，留 CAS 冲突余量）；
+ * 移动每本约 14 次，服务端上限 3，前端按 3 分批 */
+const BATCH_CHUNK_DEL = 4;
 const BATCH_CHUNK_MOVE = 3;
 
 async function chunked(items, fn, size) {
@@ -318,7 +322,7 @@ async function loadBooks() {
           .catch(() => [])
       )
     );
-    S.books = groups.flat().sort((a, b) => (b.mtime || 0) - (a.mtime || 0));
+    S.books = groups.flat().sort(cmpBooks);
   } else {
     const r = await api('/api/cat/' + encodeURIComponent(S.cur));
     S.books = (r.books || []).map((b) => ({ ...b, slug: S.cur, catName: r.name || S.cur }));

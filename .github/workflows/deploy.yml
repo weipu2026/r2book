@@ -19,7 +19,7 @@ on:
 
 concurrency:
   group: deploy-r2book
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}

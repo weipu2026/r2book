@@ -129,8 +129,20 @@ function safeEqual(a, b) {
   return d === 0;
 }
 
+/* HMAC CryptoKey 缓存：importKey 比 sign 贵，同一 isolate 内按 secret 复用，
+ * 鉴权密集操作（批量删除/移动循环调 cookie 校验）CPU 降约 40% */
+const hmacKeyCache = new Map();
+async function getHmacKey(secret) {
+  let k = hmacKeyCache.get(secret);
+  if (!k) {
+    k = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    hmacKeyCache.set(secret, k);
+  }
+  return k;
+}
+
 async function hmac(secret, msg) {
-  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const key = await getHmacKey(secret);
   const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(msg));
   const bytes = new Uint8Array(sig);
   let bin = '';
@@ -280,7 +292,7 @@ async function syncCatToRoot(env, slug, name) {
   const { data: cat } = await readMeta(env.BUCKET, metaCat(slug), { name: slug, books: [] });
   const books = cat.books || [];
   const bytes = books.reduce((s, b) => s + (Number(b.size) || 0), 0);
-  const res = await updateRoot(env, (root) => {
+  const res = await updateMeta(env.BUCKET, META_ROOT, { cats: [], updatedAt: 0 }, (root) => {
     let c = root.cats.find((x) => x.slug === slug);
     if (!c) {
       c = { slug };
@@ -292,7 +304,7 @@ async function syncCatToRoot(env, slug, name) {
     c.bytes = bytes;
     root.updatedAt = Date.now();
     return root;
-  });
+  }, 1); // tries=1：root 是冗余聚合数据，冲突即放弃（下次操作会修），不耗 3 次 CAS 以保批量操作 subrequest 预算
   return !!res;
 }
 
@@ -346,7 +358,8 @@ async function propfind(req, env, p) {
   // 根：列出分类（集合 href 带结尾斜杠，符合 RFC 4918 的 collection 约定）
   if (segs.length === 0 || (segs.length === 1 && segs[0] === 'books')) {
     const { data: root } = await readMeta(env.BUCKET, META_ROOT, { cats: [] });
-    out.push(davEntry('/', { name: 'books', mtime: root.updatedAt || Date.now(), isCollection: true, etag: 'root' }));
+    const selfHref = segs.length === 1 ? '/books/' : '/';
+    out.push(davEntry(selfHref, { name: 'books', mtime: root.updatedAt || Date.now(), isCollection: true, etag: 'root' }));
     if (depth !== '0') {
       for (const c of root.cats || []) {
         out.push(
@@ -493,7 +506,7 @@ async function propfindBackup(req, env, d) {
   if (d === 'infinity') return davInfinity();
   const listing = await env.BUCKET.list({ prefix: BACKUP_PREFIX });
   const out = ['<?xml version="1.0" encoding="utf-8"?>', '<D:multistatus xmlns:D="DAV:">'];
-  out.push(davEntry('/backup', { name: 'backup', mtime: Date.now(), isCollection: true, etag: 'backup' }));
+  out.push(davEntry('/backup/', { name: 'backup', mtime: Date.now(), isCollection: true, etag: 'backup' }));
   if (d !== '0') {
     for (const o of listing.objects) {
       const name = o.key.slice(BACKUP_PREFIX.length);
@@ -540,7 +553,12 @@ async function backupPut(req, env, rest) {
   const key = BACKUP_PREFIX + rest;
   const exists = listing.objects.some((o) => o.key === key);
   if (!exists && listing.objects.length >= BACKUP_MAX_ITEMS) return json({ error: '备份条目数已达上限' }, 507);
-  await env.BUCKET.put(key, body);
+  try {
+    await env.BUCKET.put(key, body);
+  } catch {
+    // R2 故障返 503 + Retry-After，避免 WebDAV 客户端对 500 重试风暴
+    return new Response(null, { status: 503, headers: { 'Retry-After': '5' } });
+  }
   return new Response(null, { status: 201 });
 }
 
@@ -556,13 +574,13 @@ const ATOM_NS = 'xmlns="http://www.w3.org/2005/Atom" xmlns:dc="http://purl.org/d
 const NAV_TYPE = 'application/atom+xml;profile=opds-catalog;kind=navigation';
 const ACQ_TYPE = 'application/atom+xml;profile=opds-catalog;kind=acquisition';
 
-function feedHeader(origin, selfHref, title, kindType) {
+function feedHeader(origin, selfHref, title, kindType, updatedMs) {
   return (
     '<?xml version="1.0" encoding="utf-8"?>\n' +
     `<feed ${ATOM_NS}>` +
     `<id>urn:r2book:${encPath(selfHref)}</id>` +
     `<title>${xmlEsc(title)}</title>` +
-    `<updated>${new Date().toISOString()}</updated>` +
+    `<updated>${new Date(updatedMs || Date.now()).toISOString()}</updated>` +
     `<author><name>r2book</name></author>` +
     `<link rel="self" href="${origin}${encPath(selfHref)}" type="${kindType}"/>` +
     `<link rel="start" href="${origin}/opds/" type="${NAV_TYPE}"/>` +
@@ -591,7 +609,7 @@ async function opdsRoot(req, env) {
   const origin = new URL(req.url).origin;
   const site = env.SITE_NAME || DEFAULT_SITE;
   const { data: root } = await readMeta(env.BUCKET, META_ROOT, { cats: [] });
-  const out = [feedHeader(origin, '/opds/', site, NAV_TYPE)];
+  const out = [feedHeader(origin, '/opds/', site, NAV_TYPE, root.updatedAt)];
   for (const c of root.cats || []) {
     out.push(
       `<entry>` +
@@ -623,12 +641,11 @@ async function opdsCat(req, env, slug) {
   const cur = Math.min(page, pages); // 页码夹紧：越界落到最后一页，而不是返回空 feed
   const slice = all.slice((cur - 1) * OPDS_PAGE_SIZE, cur * OPDS_PAGE_SIZE);
 
-  const out = [feedHeader(origin, `/opds/${slug}.xml`, `${site} · ${cat.name || slug}`, ACQ_TYPE)];
+  const updated = all.reduce((m, b) => Math.max(m, b.mtime || 0), 0) || cat.updatedAt || Date.now();
+  const out = [feedHeader(origin, `/opds/${slug}.xml`, `${site} · ${cat.name || slug}`, ACQ_TYPE, updated)];
   const catRef = (n) => encPath(`/opds/${slug}.xml`) + `?page=${n}`;
-  if (cur > 1) {
-    out.push(`<link rel="first" href="${origin}${catRef(1)}" type="${ACQ_TYPE}"/>`);
-    out.push(`<link rel="previous" href="${origin}${catRef(cur - 1)}" type="${ACQ_TYPE}"/>`);
-  }
+  if (pages > 1) out.push(`<link rel="first" href="${origin}${catRef(1)}" type="${ACQ_TYPE}"/>`);
+  if (cur > 1) out.push(`<link rel="previous" href="${origin}${catRef(cur - 1)}" type="${ACQ_TYPE}"/>`);
   if (cur < pages) out.push(`<link rel="next" href="${origin}${catRef(cur + 1)}" type="${ACQ_TYPE}"/>`);
   if (pages > 1) out.push(`<link rel="last" href="${origin}${catRef(pages)}" type="${ACQ_TYPE}"/>`);
   for (const b of slice) out.push(acqEntry(origin, slug, b));
@@ -647,15 +664,16 @@ async function opdsSearch(req, env, q) {
     let scanned = 0;
     // CPU 预算控制：搜索要解析分类 JSON（实测约 0.8ms/千本）。限「解析分类 ≤20
     // （subrequest root+20=21 有余量）且累计扫描本数 ≤10000（约 8ms）」，
-    // 超出即止，避免顶到 Free 计划 10ms CPU 硬限——hits 只截输出、不省解析。
-    for (const c of (root.cats || []).slice(0, 20)) {
-      if (scanned >= 10000) break;
+    // 超出即止，避免顶到 Free 计划 10ms CPU 硬限。scanned 每本递增（非每分类加总），
+    // 单个大分类也能在预算内截断；hits 上限用 labeled break 全局生效。
+    scan: for (const c of (root.cats || []).slice(0, 20)) {
       const { data: cat } = await readMeta(env.BUCKET, metaCat(c.slug), { books: [] });
-      scanned += (cat.books || []).length;
       for (const b of cat.books || []) {
+        if (scanned >= 10000 || hits >= 50) break scan;
+        scanned++;
         if (String(b.title || b.file).toLowerCase().includes(key)) {
           out.push(acqEntry(origin, c.slug, b));
-          if (++hits >= 50) break;
+          hits++;
         }
       }
     }
@@ -735,7 +753,7 @@ async function apiExport(env) {
     out.categories.push({
       slug: c.slug,
       name: cat.name || c.name || c.slug,
-      books: sortBooks(cat.books).map((b) => ({ file: b.file, title: b.title, size: b.size || 0, mtime: b.mtime || 0 })),
+      books: (cat.books || []).map((b) => ({ file: b.file, title: b.title, size: b.size || 0, mtime: b.mtime || 0 })),
     });
   }
   return json(out);
@@ -842,7 +860,7 @@ async function trashBook(env, slug, file) {
   if (!src) return { file, ok: false, error: '文件不存在' };
 
   const ts = Date.now();
-  await env.BUCKET.put(trashKey(ts, slug, file), await src.arrayBuffer(), { httpMetadata: { contentType: contentType(file) } });
+  await env.BUCKET.put(trashKey(ts, slug, file), src.body, { httpMetadata: { contentType: contentType(file) } });
   await env.BUCKET.delete(key);
 
   const updated = await updateCat(env, slug, (cat) => {
@@ -873,7 +891,7 @@ async function apiBatchDelete(req, env) {
   const body = await req.json().catch(() => ({}));
   const items = Array.isArray(body.items) ? body.items : [];
   if (!items.length) return json({ error: '缺少 items' }, 400);
-  if (items.length > 5) return json({ error: '单次最多 5 项，请分批调用' }, 413);
+  if (items.length > 4) return json({ error: '单次最多 4 项，请分批调用' }, 413);
 
   const results = [];
   for (const it of items) {
@@ -903,8 +921,8 @@ async function moveBook(env, slug, file, toSlug, newName) {
 
   const src = await env.BUCKET.get(bookKey(slug, file));
   if (!src) return { file, ok: false, error: '文件不存在' };
-  const buf = await src.arrayBuffer();
-  await env.BUCKET.put(bookKey(toSlug, dst), buf, { httpMetadata: { contentType: contentType(dst) } });
+  const size = src.size;
+  await env.BUCKET.put(bookKey(toSlug, dst), src.body, { httpMetadata: { contentType: contentType(dst) } });
   await env.BUCKET.delete(bookKey(slug, file));
 
   const srcOk = await updateCat(env, slug, (cat) => {
@@ -915,13 +933,13 @@ async function moveBook(env, slug, file, toSlug, newName) {
     if (!Array.isArray(cat.books)) cat.books = [];
     // 同分类改名时，这里既清旧名也去重新名，避免重复条目
     cat.books = cat.books.filter((b) => b.file !== dst);
-    cat.books.push({ file: dst, title: titleOf(dst), size: buf.byteLength, mtime: Date.now() });
+    cat.books.push({ file: dst, title: titleOf(dst), size, mtime: Date.now() });
     return cat;
   });
   // 文件已搬但索引冲突：如实上报，让用户重建索引兜底，而不是假装成功
   if (!srcOk || !dstOk) return { file, ok: false, error: '索引写入冲突，文件已搬运，请重建索引' };
   await syncCatToRoot(env, slug);
-  await syncCatToRoot(env, toSlug);
+  if (slug !== toSlug) await syncCatToRoot(env, toSlug); // 同分类改名只同步一次
   return { file, ok: true };
 }
 
@@ -991,14 +1009,14 @@ async function apiRestore(req, env) {
     return json({ error: `目标分类已有《${file}》，先改名/换分类，或先删除现有同名书`, exists: true }, 409);
   }
 
-  const buf = await src.arrayBuffer();
-  await env.BUCKET.put(bookKey(slug, file), buf, { httpMetadata: { contentType: contentType(file) } });
+  const size = src.size;
+  await env.BUCKET.put(bookKey(slug, file), src.body, { httpMetadata: { contentType: contentType(file) } });
   await env.BUCKET.delete(key);
 
   const ok = await updateCat(env, slug, (cat) => {
     if (!Array.isArray(cat.books)) cat.books = [];
     if (!cat.books.some((b) => b.file === file)) {
-      cat.books.push({ file, title: titleOf(file), size: buf.byteLength, mtime: Date.now() });
+      cat.books.push({ file, title: titleOf(file), size, mtime: Date.now() });
     }
     return cat;
   });
@@ -1032,7 +1050,7 @@ async function apiRebuild(req, env) {
     slugs = (listed.delimitedPrefixes || []).map((p) => p.slice('books/'.length).replace(/\/$/, '')).filter(Boolean);
   }
 
-  const idx = body.cursor ? slugs.indexOf(body.cursor) : -1;
+  const idx = body.cursor && slugs ? slugs.indexOf(body.cursor) : -1;
   const next = slugs[idx + 1];
 
   if (!next) {
@@ -1101,8 +1119,24 @@ async function handleApi(req, env, url, p) {
 
 /* ---------------- 入口 ---------------- */
 
+/* 一次性告警：DAV_PASSWORD/SESSION_SECRET 缺省时回退 ADMIN_PASSWORD，安全性下降
+ * （手机端/会话密钥与管理口令同值）。每 isolate 只 warn 一次，wrangler tail 可见。
+ * 不拒绝启动，保留易部署性；用户看到日志后自行补配置即可。 */
+let insecureWarned = false;
+function warnInsecureEnv(env) {
+  if (insecureWarned) return;
+  const missing = [];
+  if (!env.DAV_PASSWORD) missing.push('DAV_PASSWORD');
+  if (!env.SESSION_SECRET) missing.push('SESSION_SECRET');
+  if (missing.length) {
+    insecureWarned = true;
+    console.warn(`[r2book] ${missing.join(' / ')} 未设置，回退到 ADMIN_PASSWORD，安全性下降（手机端/会话密钥与管理口令同值）`);
+  }
+}
+
 export default {
   async fetch(req, env) {
+    warnInsecureEnv(env);
     const url = new URL(req.url);
     const p = url.pathname;
 
