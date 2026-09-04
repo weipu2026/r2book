@@ -58,8 +58,32 @@ const json = (data, status = 200, headers = {}) =>
     headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', ...headers },
   });
 
-const xml = (body, status = 200) =>
-  new Response(body, { status, headers: { 'content-type': 'application/xml; charset=utf-8', 'cache-control': 'no-store' } });
+/** FNV-1a 轻量哈希：给 feed 生成 ETag（纯整数运算，无需 crypto）。 */
+const fnv36 = (s) => {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(36);
+};
+
+/** XML 响应统一出口（OPDS feed 与 WebDAV PROPFIND 共用）。
+ * ETag + 304 重验证：慢的从来不是正文带宽而是跨洋往返，no-cache 允许客户端
+ * 存储正文但每次须重验证，重复打开书库只需一个 304 头，省整段正文。
+ * 仅 200 参与 304（PROPFIND 207 不该走缓存语义）；不支持 If-None-Match 的
+ * 客户端自动退化为完整响应，无兼容性风险。 */
+const xml = (req, body, status = 200) => {
+  const etag = `"${status}-${fnv36(body)}"`;
+  const inm = req && req.headers ? req.headers.get('if-none-match') : null;
+  if (status === 200 && inm && inm.split(',').some((t) => t.trim() === etag)) {
+    return new Response(null, { status: 304, headers: { etag, 'cache-control': 'no-cache' } });
+  }
+  return new Response(body, {
+    status,
+    headers: { 'content-type': 'application/xml; charset=utf-8', 'cache-control': 'no-cache', etag },
+  });
+};
 
 const notFound = () => new Response('Not Found', { status: 404 });
 
@@ -341,7 +365,7 @@ function davOptions(zone = 'books') {
 }
 
 const davInfinity = () =>
-  xml('<?xml version="1.0" encoding="utf-8"?>\n<D:error xmlns:D="DAV:"><D:propfind-finite-depth-lock/></D:error>', 403);
+  xml(null, '<?xml version="1.0" encoding="utf-8"?>\n<D:error xmlns:D="DAV:"><D:propfind-finite-depth-lock/></D:error>', 403);
 
 function davEntry(href, opts) {
   const { name, mtime, isCollection, size, etag } = opts;
@@ -386,7 +410,7 @@ async function propfind(req, env, p) {
       }
     }
     out.push('</D:multistatus>');
-    return xml(out.join(''), 207);
+    return xml(req, out.join(''), 207);
   }
 
   // 分类：列出该类的书
@@ -410,7 +434,7 @@ async function propfind(req, env, p) {
       }
     }
     out.push('</D:multistatus>');
-    return xml(out.join(''), 207);
+    return xml(req, out.join(''), 207);
   }
 
   // 单文件
@@ -430,7 +454,7 @@ async function propfind(req, env, p) {
       })
     );
     out.push('</D:multistatus>');
-    return xml(out.join(''), 207);
+    return xml(req, out.join(''), 207);
   }
 
   return notFound();
@@ -555,7 +579,7 @@ async function propfindBackup(req, env, d, rest = '') {
     }
   }
   out.push('</D:multistatus>');
-  return xml(out.join(''), 207);
+  return xml(req, out.join(''), 207);
 }
 
 async function backupGet(req, env, rest, head) {
@@ -659,7 +683,7 @@ async function opdsRoot(req, env) {
     );
   }
   out.push('</feed>');
-  return xml(out.join(''));
+  return xml(req, out.join(''));
 }
 
 /** 分类 feed 分页：OPDS 规范用 rel="first/previous/next/last" 链接翻页，
@@ -687,7 +711,7 @@ async function opdsCat(req, env, slug) {
   if (pages > 1) out.push(`<link rel="last" href="${origin}${catRef(pages)}" type="${ACQ_TYPE}"/>`);
   for (const b of slice) out.push(acqEntry(origin, slug, b));
   out.push('</feed>');
-  return xml(out.join(''));
+  return xml(req, out.join(''));
 }
 
 async function opdsSearch(req, env, q) {
@@ -716,13 +740,14 @@ async function opdsSearch(req, env, q) {
     }
   }
   out.push('</feed>');
-  return xml(out.join(''));
+  return xml(req, out.join(''));
 }
 
 function opdsOpenSearch(req, env) {
   const origin = new URL(req.url).origin;
   const site = env.SITE_NAME || DEFAULT_SITE;
   return xml(
+    req,
     '<?xml version="1.0" encoding="utf-8"?>\n' +
       '<OpenSearchDescription xmlns="http://a9.com/-/spec/opensearch/1.1/">' +
       `<ShortName>${xmlEsc(site)}</ShortName>` +
