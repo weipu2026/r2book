@@ -114,15 +114,18 @@ const validFile = (f) => {
 function contentType(name) {
   const ext = String(name).split('.').pop().toLowerCase();
   const map = {
-    txt: 'text/plain; charset=utf-8',
-    text: 'text/plain; charset=utf-8',
+    /* 纯文本不带 charset：中文小说 txt 大量是 GBK/GB18030，标 charset=utf-8 会
+     * 让阅读器优先信 HTTP 头按 UTF-8 解码出乱码（覆盖用户手选编码）。
+     * 裸 text/plain 让阅读器自行探测/手选。 */
+    txt: 'text/plain',
+    text: 'text/plain',
     epub: 'application/epub+zip',
     pdf: 'application/pdf',
     mobi: 'application/x-mobipocket-ebook',
     azw3: 'application/vnd.amazon.ebook',
     zip: 'application/zip',
-    md: 'text/markdown; charset=utf-8',
-    html: 'text/html; charset=utf-8',
+    md: 'text/markdown',
+    html: 'text/html',
   };
   return map[ext] || 'application/octet-stream';
 }

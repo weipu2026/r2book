@@ -51,21 +51,6 @@ async function api(path, opts = {}) {
   return data;
 }
 
-/** 中文小说 txt 大量是 GBK，用 fatal 模式探测后再决定解码器 */
-function decodeNovel(buf) {
-  const head = buf.slice(0, 65536);
-  let enc = 'utf-8';
-  try {
-    new TextDecoder('utf-8', { fatal: true }).decode(head);
-  } catch {
-    try {
-      new TextDecoder('gbk').decode(head);
-      enc = 'gbk';
-    } catch { /* 环境不支持 gbk，退回 utf-8 */ }
-  }
-  return { text: new TextDecoder(enc).decode(buf), enc };
-}
-
 function post(url, body, onProgress) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
@@ -398,10 +383,6 @@ function queueRow(name) {
 
 const WORD_EXT = /\.(docx?|wps|rtf|odt)$/i;
 
-/* 只有纯文本才需要 GBK→UTF-8 转码；epub/pdf/mobi 等是二进制，
- * 转码会把它当成乱码文本重编码导致文件损坏，必须原样上传 */
-const TEXT_EXT = /\.(txt|text)$/i;
-
 /* 书名清洗：剥掉中英文括号里带广告特征词的片段，保留《》书名号与正常括号 */
 const AD_BRACKET =
   /[【\[(（][^【】\[\]（）()]*?(?:www\s?\.|https?:\/\/|\.(?:com|net|cc|org|info|top|xyz)\b|小说|文学|首发|手打|笔趣|书城|阅读网|更新最快|无弹窗|全文阅读|免费阅|书友|交流群)[^【】\[\]（）()]*?[】\])）]/gi;
@@ -441,15 +422,12 @@ async function handleFiles(fileList) {
     const row = queueRow(fname !== f.name ? `${f.name} → ${fname}` : f.name);
     try {
       const buf = await f.arrayBuffer();
-      let out = buf;
-      if (TEXT_EXT.test(fname)) {
-        row.note('转码中');
-        const { text, enc } = decodeNovel(buf);
-        out = new TextEncoder().encode(text);
-        row.note(enc === 'gbk' ? 'GBK → UTF-8' : enc);
-      } else {
-        row.note('原样上传');
-      }
+      /* 原样上传、不做任何编码转换：文件字节与本地完全一致，
+       * GBK/UTF-8/UTF-16 都交给阅读器自己探测或手选（Librera 支持很全）。
+       * 之前服务端 GBK→UTF-8 自动转码有探测盲区（如 UTF-16 被误判为 GBK
+       * 转出乱码），且裸字节 + 阅读'器手选是更稳的方案 */
+      const out = buf;
+      row.note('原样上传');
       const url = `/api/upload?cat=${encodeURIComponent(slug)}&catName=${encodeURIComponent(catName)}&file=${encodeURIComponent(fname)}`;
       let res;
       try {
