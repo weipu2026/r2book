@@ -101,6 +101,12 @@ const safeSeg = (s) =>
     .replace(/^\.+/, '')
     .trim();
 
+/** 长度上限：R2 单 key ≤1024 字节，books/<slug>/<file> 按中文 3 字节/字留余量。
+ * 超长直接 400，别让 R2 在 put/get 时抛难懂的 500。 */
+const MAX_SLUG_LEN = 64;
+const MAX_FILE_LEN = 240;
+const badSlug = (slug) => !slug || slug.length > MAX_SLUG_LEN;
+
 const titleOf = (file) => String(file).replace(/\.[^.]+$/, '').trim();
 
 /** 文件名用原始值（不做 safeSeg 改形，兼容 rclone 直灌的特殊字符文件名），
@@ -108,7 +114,7 @@ const titleOf = (file) => String(file).replace(/\.[^.]+$/, '').trim();
  * slug 仍走 safeSeg，两者组合保持 R2 key 无穿越。 */
 const validFile = (f) => {
   const s = String(f || '');
-  return !!s && s !== '.' && s !== '..' && !s.includes('/') && !s.includes('\\');
+  return !!s && s.length <= MAX_FILE_LEN && s !== '.' && s !== '..' && !s.includes('/') && !s.includes('\\');
 };
 
 function contentType(name) {
@@ -463,17 +469,22 @@ async function propfind(req, env, p) {
   return notFound();
 }
 
+/** Range 解析。返回 null = 头无法支持（畸形/多段），调用方应忽略并回完整 200
+ * （RFC 7233：不可理解的 Range 头必须忽略，而不是 416）；
+ * 'unsat' = 语法合法但越界（bytes=-0 / end<start），应回 416。 */
 function parseRange(h) {
-  const m = /^bytes=(\d*)-(\d*)$/.exec(String(h).trim());
-  if (!m) return 'invalid';
+  const raw = String(h).trim();
+  if (raw.includes(',')) return null; // 多段 Range 不支持，按未携带处理
+  const m = /^bytes=(\d*)-(\d*)$/.exec(raw);
+  if (!m) return null;
   const s = m[1];
   const e = m[2];
-  if (s === '' && e === '') return 'invalid';
-  if (s === '') return Number(e) > 0 ? { suffix: Number(e) } : 'invalid'; // bytes=-0 无意义
+  if (s === '' && e === '') return 'unsat';
+  if (s === '') return Number(e) > 0 ? { suffix: Number(e) } : 'unsat'; // bytes=-0 无意义
   if (e === '') return { offset: Number(s) };
   const start = Number(s);
   const end = Number(e);
-  if (end < start) return 'invalid';
+  if (end < start) return 'unsat';
   return { offset: start, length: end - start + 1 };
 }
 
@@ -486,10 +497,17 @@ async function getFile(req, env, p, head) {
   let rangeOpt;
   if (rangeHeader) {
     rangeOpt = parseRange(rangeHeader);
-    if (rangeOpt === 'invalid') return new Response(null, { status: 416, headers: { 'Content-Range': 'bytes */*' } });
+    if (rangeOpt === 'unsat') return new Response(null, { status: 416, headers: { 'Content-Range': 'bytes */*' } });
+    // null（畸形/多段）→ 当作未携带处理，回完整 200
   }
 
-  const obj = rangeOpt ? await env.BUCKET.get(bookKey(slug, file), { range: rangeOpt }) : await env.BUCKET.get(bookKey(slug, file));
+  let obj;
+  try {
+    obj = rangeOpt ? await env.BUCKET.get(bookKey(slug, file), { range: rangeOpt }) : await env.BUCKET.get(bookKey(slug, file));
+  } catch {
+    // R2 对越界 range（offset ≥ 文件大小）抛错而不是返回空对象：按规范回 416
+    return new Response(null, { status: 416, headers: { 'Content-Range': 'bytes */*' } });
+  }
   if (!obj) return notFound();
 
   const headers = new Headers();
@@ -498,6 +516,7 @@ async function getFile(req, env, p, head) {
   headers.set('ETag', `"${obj.etag}"`);
   headers.set('Cache-Control', 'no-store'); // 私密书库：禁止浏览器缓存正文
   headers.set('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(file)}`);
+  headers.set('X-Content-Type-Options', 'nosniff');
 
   let status = 200;
   if (rangeOpt) {
@@ -594,6 +613,7 @@ async function backupGet(req, env, rest, head) {
     'Content-Length': String(obj.size),
     'ETag': `"${obj.etag}"`,
     'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
   });
   if (head) return new Response(null, { status: 200, headers });
   return new Response(obj.body, { status: 200, headers });
@@ -845,8 +865,8 @@ async function apiCatGet(env, slug) {
 async function apiCatUpsert(req, env) {
   const body = await req.json().catch(() => ({}));
   const slug = safeSeg(body.slug);
-  const name = String(body.name || '').trim();
-  if (!slug) return json({ error: '缺少 slug' }, 400);
+  const name = String(body.name || '').trim().slice(0, MAX_SLUG_LEN);
+  if (badSlug(slug)) return json({ error: '缺少 slug' }, 400);
   const ok = await updateCat(env, slug, (cat) => {
     cat.name = name || cat.name || slug;
     if (!Array.isArray(cat.books)) cat.books = [];
@@ -860,6 +880,7 @@ async function apiCatUpsert(req, env) {
 async function apiCatDelete(req, env) {
   const body = await req.json().catch(() => ({}));
   const slug = safeSeg(body.slug);
+  if (badSlug(slug)) return json({ error: '参数不合法' }, 400);
   const { data: cat } = await readMeta(env.BUCKET, metaCat(slug), { books: [] });
   if ((cat.books || []).length) return json({ error: '分类非空，请先移出或删除其中的书' }, 400);
   await env.BUCKET.delete(metaCat(slug));
@@ -873,10 +894,10 @@ async function apiCatDelete(req, env) {
 
 async function apiUpload(req, env, url) {
   const slug = safeSeg(url.searchParams.get('cat'));
-  const catName = (url.searchParams.get('catName') || '').trim();
+  const catName = (url.searchParams.get('catName') || '').trim().slice(0, MAX_SLUG_LEN);
   const file = safeSeg(url.searchParams.get('file'));
   const overwrite = url.searchParams.get('ow') === '1';
-  if (!slug || !file) {
+  if (badSlug(slug) || !file) {
     await dropBody(req);
     return json({ error: '缺少 cat 或 file 参数' }, 400);
   }
@@ -949,7 +970,7 @@ async function apiDelete(req, env) {
   const body = await req.json().catch(() => ({}));
   const slug = safeSeg(body.slug);
   const file = body.file;
-  if (!slug || !validFile(file)) return json({ error: '参数不合法' }, 400);
+  if (badSlug(slug) || !validFile(file)) return json({ error: '参数不合法' }, 400);
   const r = await trashBook(env, slug, file);
   if (!r.ok) return json({ error: r.error }, r.error === '文件不存在' ? 404 : 400);
   return json({ ok: true, trash: r.trash });
@@ -969,7 +990,7 @@ async function apiBatchDelete(req, env) {
   for (const it of items) {
     const slug = safeSeg(it && it.slug);
     const file = it && it.file;
-    if (!slug || !validFile(file)) {
+    if (badSlug(slug) || !validFile(file)) {
       results.push({ file, ok: false, error: '参数不合法' });
       continue;
     }
@@ -984,6 +1005,7 @@ async function apiBatchDelete(req, env) {
  */
 async function moveBook(env, slug, file, toSlug, newName) {
   const dst = safeSeg(newName) || file;
+  if (dst.length > MAX_FILE_LEN) return { file, ok: false, error: '文件名过长' };
   if (slug === toSlug && dst === file) return { file, ok: true, noop: true };
 
   const { data: dstCat } = await readMeta(env.BUCKET, metaCat(toSlug), { books: [] });
@@ -1031,7 +1053,7 @@ async function apiMove(req, env) {
     const slug = safeSeg(it && it.slug);
     const file = it && it.file;
     const toSlug = safeSeg(it && it.toSlug);
-    if (!slug || !validFile(file) || !toSlug) {
+    if (badSlug(slug) || badSlug(toSlug) || !validFile(file)) {
       results.push({ file, ok: false, error: '参数不合法' });
       continue;
     }
@@ -1066,7 +1088,7 @@ async function apiRestore(req, env) {
   const body = await req.json().catch(() => ({}));
   const key = String(body.key || '');
   const slug = safeSeg(body.slug);
-  if (!key.startsWith('_trash/') || !slug) return json({ error: '参数不合法' }, 400);
+  if (!key.startsWith('_trash/') || badSlug(slug)) return json({ error: '参数不合法' }, 400);
   // key = _trash/<时间戳>/<分类>/<文件名>，取最后一段为真实文件名（兼容旧格式 _trash/<ts>/<file>）
   // 用原始值 + validFile，保留 rclone 直灌的特殊字符文件名
   const file = key.slice(key.lastIndexOf('/') + 1);
@@ -1243,6 +1265,13 @@ export default {
     }
 
     if (p.startsWith('/api/')) return handleApi(req, env, url, p);
+
+    // DAV 惯例：OPTIONS 免鉴权——客户端用它探测服务器能力，之后才带凭据发真实请求。
+    // 这里若先 401，部分客户端会直接认为「不支持 WebDAV」而放弃握手。
+    if (req.method === 'OPTIONS') {
+      if (p === '/backup' || p.startsWith('/backup/')) return davOptions('backup');
+      if (p === '/' || p.startsWith('/books') || p.startsWith('/opds')) return davOptions('books');
+    }
 
     // 浏览器访问根路径 → 上传端页面（公开，登录在页内完成）
     if ((p === '/' || p === '/index.html') && req.method === 'GET' && (req.headers.get('accept') || '').includes('text/html')) {

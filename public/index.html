@@ -11,7 +11,9 @@
 
 <div id="login" class="login-mask">
   <form id="login-form" class="login-box">
+    <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg></span>
     <h1>私人书库</h1>
+    <p class="login-sub">上传小说 · 手机随时取阅</p>
     <input type="password" id="login-pwd" placeholder="管理口令" autocomplete="current-password" autofocus>
     <button type="submit">进入</button>
     <p id="login-err" class="login-err"></p>
@@ -21,6 +23,7 @@
 <div id="app" hidden>
   <header class="topbar">
     <div class="brand">
+      <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg></span>
       <span class="brand-name" id="site-name">私人书库</span>
     </div>
     <div class="quota">
@@ -45,9 +48,10 @@
 
     <section class="content">
       <div class="dropzone" id="dropzone">
+        <span class="dz-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg></span>
         <p class="dz-main">把小说拖到这里，或 <button class="link" id="btn-pick">选择文件</button></p>
         <p class="dz-sub" id="dz-target">上传目标：请先在左侧选一个分类</p>
-        <label class="dz-opt"><input type="checkbox" id="opt-clean" checked> 自动清洗书名（剥掉【www.xxx.com】之类广告后缀）</label>
+        <label class="dz-opt" title="剥掉【www.xxx.com】之类广告后缀"><input type="checkbox" id="opt-clean" checked> 自动清洗书名</label>
         <input type="file" id="file-input" multiple accept=".txt,.text,.epub,.pdf,.mobi,.azw3,.zip,.md" hidden>
       </div>
 
