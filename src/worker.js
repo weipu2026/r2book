@@ -129,6 +129,19 @@ function safeEqual(a, b) {
   return d === 0;
 }
 
+/* 丢弃未使用的请求体。Workers 在「响应已发出但 request stream 未消费」时会抛
+ * "Can't read from request stream after response has been sent"，isolate 直接崩，
+ * 之后所有请求一律 500。任何提前 return 且没读过 body 的分支都要先调它。
+ * 注意：必须真读（arrayBuffer）而不是 body.cancel()——实测本地 workerd 在
+ * cancel 未消费的流后连接层仍会崩（2026-09 探针复现），读掉才稳。 */
+async function dropBody(req) {
+  try {
+    if (req.body && !req.bodyUsed) await req.arrayBuffer();
+  } catch {
+    /* 流异常或已关闭，忽略 */
+  }
+}
+
 /* HMAC CryptoKey 缓存：importKey 比 sign 贵，同一 isolate 内按 secret 复用，
  * 鉴权密集操作（批量删除/移动循环调 cookie 校验）CPU 降约 40% */
 const hmacKeyCache = new Map();
@@ -485,7 +498,7 @@ async function handleDav(req, env, p, zone = 'books') {
   if (zone === 'backup') {
     const segs = decodeSegs(p);
     const rest = segs.slice(1).join('/');
-    if (m === 'PROPFIND') return propfindBackup(req, env, depth(req));
+    if (m === 'PROPFIND') return propfindBackup(req, env, depth(req), rest);
     if (m === 'GET' || m === 'HEAD') return backupGet(req, env, rest, m === 'HEAD');
     if (m === 'PUT') return backupPut(req, env, rest);
     if (m === 'MKCOL') return rest ? new Response(null, { status: 201 }) : new Response(null, { status: 405 });
@@ -502,17 +515,35 @@ async function handleDav(req, env, p, zone = 'books') {
 
 const depth = (req) => (req.headers.get('Depth') || '1').toLowerCase();
 
-async function propfindBackup(req, env, d) {
+/** /backup/ 的 PROPFIND：按请求路径列目录（prefix + delimiter 区分子目录与文件），
+ * 而不是无脑平铺整个备份区——否则客户端拿到的永远是一份「全量扁平列表」，
+ * 按目录取文件会 404。 */
+async function propfindBackup(req, env, d, rest = '') {
   if (d === 'infinity') return davInfinity();
-  const listing = await env.BUCKET.list({ prefix: BACKUP_PREFIX });
+  const dir = rest && !rest.endsWith('/') ? rest + '/' : rest;
+  const prefix = BACKUP_PREFIX + dir;
+  const listing = await env.BUCKET.list({ prefix, delimiter: '/' });
+  const selfHref = '/backup/' + dir;
   const out = ['<?xml version="1.0" encoding="utf-8"?>', '<D:multistatus xmlns:D="DAV:">'];
-  out.push(davEntry('/backup/', { name: 'backup', mtime: Date.now(), isCollection: true, etag: 'backup' }));
+  out.push(
+    davEntry(selfHref, {
+      name: dir ? dir.slice(0, -1).split('/').pop() : 'backup',
+      mtime: Date.now(),
+      isCollection: true,
+      etag: 'backup-' + (dir || 'root'),
+    })
+  );
   if (d !== '0') {
+    for (const dp of listing.delimitedPrefixes || []) {
+      const name = dp.slice(prefix.length).replace(/\/$/, '');
+      if (!name) continue;
+      out.push(davEntry(selfHref + name + '/', { name, mtime: Date.now(), isCollection: true, etag: 'dir-' + name }));
+    }
     for (const o of listing.objects) {
-      const name = o.key.slice(BACKUP_PREFIX.length);
-      if (!name || name.endsWith('/')) continue;
+      const name = o.key.slice(prefix.length);
+      if (!name) continue;
       out.push(
-        davEntry(`/backup/${name}`, {
+        davEntry(selfHref + name, {
           name,
           mtime: o.uploaded ? o.uploaded.getTime() : Date.now(),
           isCollection: false,
@@ -542,10 +573,16 @@ async function backupGet(req, env, rest, head) {
 }
 
 async function backupPut(req, env, rest) {
-  if (!rest || rest.endsWith('/')) return json({ error: 'backup 路径不合法' }, 400);
+  if (!rest || rest.endsWith('/')) {
+    await dropBody(req);
+    return json({ error: 'backup 路径不合法' }, 400);
+  }
   const max = Number(env.BACKUP_MAX || BACKUP_MAX_DEFAULT);
   const declared = Number(req.headers.get('content-length') || 0);
-  if (declared > max) return json({ error: `备份文件超过上限 ${(max / 1048576) | 0}MB` }, 413);
+  if (declared > max) {
+    await dropBody(req);
+    return json({ error: `备份文件超过上限 ${(max / 1048576) | 0}MB` }, 413);
+  }
   const body = await req.arrayBuffer();
   if (body.byteLength > max) return json({ error: `备份文件超过上限 ${(max / 1048576) | 0}MB` }, 413);
   // 条目数防护：只在新增时检查，覆盖写不占新名额
@@ -811,16 +848,23 @@ async function apiUpload(req, env, url) {
   const catName = (url.searchParams.get('catName') || '').trim();
   const file = safeSeg(url.searchParams.get('file'));
   const overwrite = url.searchParams.get('ow') === '1';
-  if (!slug || !file) return json({ error: '缺少 cat 或 file 参数' }, 400);
+  if (!slug || !file) {
+    await dropBody(req);
+    return json({ error: '缺少 cat 或 file 参数' }, 400);
+  }
 
   const max = Number(env.MAX_UPLOAD || 52428800);
   const declared = Number(req.headers.get('content-length') || 0);
-  if (declared > max) return json({ error: `文件超过上限 ${(max / 1048576) | 0}MB` }, 413);
+  if (declared > max) {
+    await dropBody(req);
+    return json({ error: `文件超过上限 ${(max / 1048576) | 0}MB` }, 413);
+  }
 
   // 同名查重：读分片元数据即可（1 次 subrequest），不查 R2 本体
   const { data: existing } = await readMeta(env.BUCKET, metaCat(slug), { books: [] });
   const dup = (existing.books || []).find((b) => b.file === file);
   if (dup && !overwrite) {
+    await dropBody(req);
     return json({ error: '已存在同名书', exists: true, title: dup.title || titleOf(file), size: dup.size || 0, mtime: dup.mtime || 0 }, 409);
   }
 
@@ -1090,8 +1134,20 @@ async function apiRebuild(req, env) {
 }
 
 async function handleApi(req, env, url, p) {
-  if (p === '/api/login') return req.method === 'POST' ? apiLogin(req, env) : json({ error: 'method' }, 405);
-  if (!(await verifyCookie(req, env))) return json({ error: 'unauthorized' }, 401);
+  // 下面每个「提前返回」分支都不会读 request body，必须先 dropBody：
+  // 否则 Workers 抛 "Can't read from request stream after response has been sent"，
+  // isolate 崩掉之后整站 500（典型场景：会话过期后前端的 POST 全部 401 → 站点假死）
+  if (p === '/api/login') {
+    if (req.method !== 'POST') {
+      await dropBody(req);
+      return json({ error: 'method' }, 405);
+    }
+    return apiLogin(req, env);
+  }
+  if (!(await verifyCookie(req, env))) {
+    await dropBody(req);
+    return json({ error: 'unauthorized' }, 401);
+  }
 
   // 全部限方法：改数据接口只认 POST/DELETE，GET 一律 405。
   // SameSite=Lax 下跨站顶级 GET 导航也会带 cookie，方法限制堵住「点链接即改库」的 CSRF 链
@@ -1114,6 +1170,7 @@ async function handleApi(req, env, url, p) {
   // 否则 metaCat 拿编码串查 key 永远 404（「全部书目」视图因此恒为空）
   if (m && req.method === 'GET') return apiCatGet(env, safeSeg(decSeg(m[1])));
 
+  await dropBody(req);
   return json({ error: 'not found' }, 404);
 }
 
@@ -1139,6 +1196,23 @@ export default {
     warnInsecureEnv(env);
     const url = new URL(req.url);
     const p = url.pathname;
+
+    // 请求体排空：Workers 在「响应已发出但 request body 未消费」时会抛
+    // "Can't read from request stream after response has been sent"，整个 isolate 崩溃，
+    // 之后所有请求一律 500 —— 表现就是「阅读器连一次就再也连不上」。
+    // 只读区（/books/）对 PUT/MKCOL/DELETE 返回 405，以及任何鉴权失败的写请求，
+    // 都不会去读 body，必须在这里先丢弃。真正需要 body 的通道不能碰。
+    // 注意：用 arrayBuffer 真读丢弃，不用 body.cancel()（本地 workerd 实测 cancel 后仍崩）
+    const needsBody =
+      p.startsWith('/api/') ||
+      ((p === '/backup' || p.startsWith('/backup/')) && (req.method === 'PUT' || req.method === 'POST' || req.method === 'PATCH'));
+    if (!needsBody && req.body && !req.bodyUsed) {
+      try {
+        await req.arrayBuffer();
+      } catch {
+        /* 流异常或已关闭，忽略 */
+      }
+    }
 
     if (p.startsWith('/api/')) return handleApi(req, env, url, p);
 
