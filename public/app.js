@@ -392,6 +392,119 @@ function queueRow(name) {
   };
 }
 
+/* ---- zip 批量解包：纯浏览器原生（DecompressionStream），零依赖 ----
+ * 小说打包下载的 zip 里中文文件名常是 GBK，按文件名原始字节转码成 UTF-8；
+ * 逐条目独立解压，单条目限 Z_EXTRACT_MAX，防解压炸弹。 */
+
+const ZIP_EXT = /\.zip$/i;
+const Z_EXTRACT_MAX = 30 * 1024 * 1024; // 单条目解压上限 30MB（防炸弹）
+
+/** zip 文件名原始字节（GBK）→ UTF-8 字符串。需读取本地文件，浏览器默认可用 */
+async function zipFileNameRaw(entry, file) {
+  const reader = new FileReader();
+  return new Promise((resolve) => {
+    reader.onerror = () => resolve(null);
+    reader.onload = () => {
+      try {
+        const u8 = new Uint8Array(reader.result);
+        resolve(new TextDecoder('gbk').decode(u8));
+      } catch { resolve(null); }
+    };
+    reader.readAsArrayBuffer(file.slice(entry.nameOffset, entry.nameOffset + entry.nameLen));
+  });
+}
+
+/** 从 zip 字节里定位 EOCD，取中央目录条目（名字、本地头偏移）。畸形/截断抛错 */
+function zipEntries(u8) {
+  if (u8[0] !== 0x50 || u8[1] !== 0x4b || u8[2] !== 0x03 || u8[3] !== 0x04) {
+    throw new Error('不是有效的 zip 文件');
+  }
+  let eocd = -1;
+  for (let i = Math.max(0, u8.length - 22 - 65536); i <= u8.length - 22; i++) {
+    if (u8[i] === 0x50 && u8[i + 1] === 0x4b && u8[i + 2] === 0x05 && u8[i + 3] === 0x06) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error('zip 损坏：找不到目录');
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  const cdCount = dv.getUint16(eocd + 10, true);
+  const cdSize = dv.getUint32(eocd + 12, true);
+  const cdOffset = dv.getUint32(eocd + 16, true);
+  if (!cdCount || cdOffset + cdSize > u8.length) throw new Error('zip 损坏：目录越界');
+
+  const out = [];
+  let off = cdOffset;
+  for (let i = 0; i < cdCount; i++) {
+    const sig = dv.getUint32(off, true);
+    if (sig !== 0x02014b50) throw new Error('zip 损坏：目录签名错误');
+    const nameLen = dv.getUint16(off + 28, true);
+    const extraLen = dv.getUint16(off + 30, true);
+    const commentLen = dv.getUint16(off + 32, true);
+    const localOff = dv.getUint32(off + 42, true);
+    out.push({ nameOffset: off + 46, nameLen, localOff });
+    off += 46 + nameLen + extraLen + commentLen;
+  }
+  return out;
+}
+
+/** 读单个条目的本地头，返回：文件名原始字节、解压后内容（Uint8Array）、压缩数据切片起点 */
+async function zipReadEntry(file, entry) {
+  const hdr = await file.slice(entry.localOff, entry.localOff + 30).arrayBuffer();
+  const dv = new DataView(hdr);
+  if (dv.getUint32(0, true) !== 0x04034b50) throw new Error('zip 损坏：本地头签名错误');
+  const nameLen = dv.getUint16(26, true);
+  const extraLen = dv.getUint16(28, true);
+  const csize = dv.getUint32(18, true);
+  const nameBytes = new Uint8Array(await file.slice(entry.localOff + 30, entry.localOff + 30 + nameLen).arrayBuffer());
+  const compStart = entry.localOff + 30 + nameLen + extraLen;
+
+  // 解压
+  const stream = new Blob([new Uint8Array(await file.slice(compStart, compStart + csize).arrayBuffer())]).stream().pipeThrough(
+    new DecompressionStream('deflate-raw')
+  );
+  const reader = stream.getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > Z_EXTRACT_MAX) { reader.cancel(); throw new Error(`单文件解压超过 ${(Z_EXTRACT_MAX / 1048576) | 0}MB`); }
+    chunks.push(value);
+  }
+  const size = chunks.reduce((s, c) => s + c.byteLength, 0);
+  const out = new Uint8Array(size);
+  let p = 0;
+  for (const c of chunks) { out.set(c, p); p += c.byteLength; }
+  return { nameBytes, data: out };
+}
+
+/** 解包 zip 为「待上传文件」列表。失败返回 { error } 而非抛出 */
+async function unzipFiles(file) {
+  try {
+    if (typeof DecompressionStream === 'undefined') return { error: '当前浏览器不支持 zip 解包（需要较新的 Chrome/Edge/Firefox/Safari）' };
+    const buf = new Uint8Array(await file.arrayBuffer());
+    const entries = zipEntries(buf);
+    const files = [];
+    const skipped = [];
+    for (const entry of entries) {
+      const { nameBytes, data } = await zipReadEntry(file, entry);
+      let name;
+      try { name = new TextDecoder('utf-8').decode(nameBytes); } catch { name = null; }
+      if (name === null) {
+        const gbk = await zipFileNameRaw(entry, file);
+        name = gbk || ('解压_' + Date.now() + '_' + Math.floor(Math.random() * 1e6) + '.txt');
+      }
+      name = name.split('/').pop(); // 只取最末段文件名
+      if (!name || name.startsWith('.') || WORD_EXT.test(name)) { skipped.push(name || '(空名)'); continue; }
+      const f = new File([data], name, { type: '' });
+      f.origin = file.name;
+      files.push(f);
+    }
+    return { files, skipped };
+  } catch (e) {
+    return { error: e.message || 'zip 解包失败' };
+  }
+}
+
 const WORD_EXT = /\.(docx?|wps|rtf|odt)$/i;
 
 /* 只有纯文本才需要 GBK→UTF-8 转码；epub/pdf/mobi 等是二进制，
@@ -429,8 +542,23 @@ async function handleFiles(fileList) {
   if (oversize.length) {
     toast(`${oversize.length} 个文件超过上限 ${fmtSize(S.maxUpload)}，已跳过`);
   }
-  const todo = files.filter((f) => !oversize.includes(f));
+  let todo = files.filter((f) => !oversize.includes(f));
   if (!todo.length) return;
+
+  // zip 批量解包：先把 zip 展开成一个个文件，与直接上传的文件合并处理
+  const zips = todo.filter((f) => ZIP_EXT.test(f.name));
+  if (zips.length) {
+    for (const z of zips) {
+      const res = await unzipFiles(z);
+      if (res.error) { toast(`「${z.name}」${res.error}`); continue; }
+      if (res.skipped && res.skipped.length) toast(`「${z.name}」跳过 ${res.skipped.length} 个（目录/Word/隐藏文件）`);
+      if (res.files.length) {
+        todo = todo.filter((f) => f !== z).concat(res.files);
+        toast(`「${z.name}」解出 ${res.files.length} 本`);
+      }
+    }
+    if (!todo.length) return;
+  }
 
   await runPool(todo, async (f) => {
     const fname = $('#opt-clean').checked ? cleanBookName(f.name) : f.name;
@@ -599,6 +727,27 @@ async function rebuild() {
   }
 }
 
+/* ---------------- 导出书目 ---------------- */
+
+async function exportBooks() {
+  try {
+    const r = await api('/api/export');
+    const blob = new Blob([JSON.stringify(r, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    const d = new Date();
+    const p = (x) => String(x).padStart(2, '0');
+    a.download = `booklist-${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    toast(`已导出 ${r.totalBooks} 本的书目清单${r.truncated ? '（分类超 45 个，清单不完整）' : ''}`);
+  } catch (e) {
+    toast(e.message);
+  }
+}
+
 /* ---------------- 启动 ---------------- */
 
 function bind() {
@@ -617,6 +766,7 @@ function bind() {
 
   $('#btn-new-cat').onclick = newCat;
   $('#btn-rebuild').onclick = rebuild;
+  $('#btn-export').onclick = exportBooks;
   $('#btn-logout').onclick = async () => {
     await api('/api/logout', { method: 'POST' });
     location.reload();

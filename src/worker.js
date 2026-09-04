@@ -79,6 +79,14 @@ const safeSeg = (s) =>
 
 const titleOf = (file) => String(file).replace(/\.[^.]+$/, '').trim();
 
+/** 文件名用原始值（不做 safeSeg 改形，兼容 rclone 直灌的特殊字符文件名），
+ * 但强校验不能带路径分隔符 / \、不能是 . 或 ..、不能为空。
+ * slug 仍走 safeSeg，两者组合保持 R2 key 无穿越。 */
+const validFile = (f) => {
+  const s = String(f || '');
+  return !!s && s !== '.' && s !== '..' && !s.includes('/') && !s.includes('\\');
+};
+
 function contentType(name) {
   const ext = String(name).split('.').pop().toLowerCase();
   const map = {
@@ -302,7 +310,7 @@ function davOptions(zone = 'books') {
       Allow: zone === 'backup' ? DAV_ALLOW_BACKUP : DAV_ALLOW,
       DAV: '1',
       'Accept-Ranges': 'bytes',
-      'MS-Author-Via': 'DAV',
+      // 只读库不再回 MS-Author-Via，避免客户端误判可写
     },
   });
 }
@@ -335,14 +343,14 @@ async function propfind(req, env, p) {
   const base = '/' + segs.join('/');
   const out = ['<?xml version="1.0" encoding="utf-8"?>', '<D:multistatus xmlns:D="DAV:">'];
 
-  // 根：列出分类
+  // 根：列出分类（集合 href 带结尾斜杠，符合 RFC 4918 的 collection 约定）
   if (segs.length === 0 || (segs.length === 1 && segs[0] === 'books')) {
     const { data: root } = await readMeta(env.BUCKET, META_ROOT, { cats: [] });
     out.push(davEntry('/', { name: 'books', mtime: root.updatedAt || Date.now(), isCollection: true, etag: 'root' }));
     if (depth !== '0') {
       for (const c of root.cats || []) {
         out.push(
-          davEntry(`/books/${c.slug}`, {
+          davEntry(`/books/${c.slug}/`, {
             name: c.name || c.slug,
             mtime: root.updatedAt || Date.now(),
             isCollection: true,
@@ -360,7 +368,7 @@ async function propfind(req, env, p) {
     const slug = segs[1];
     const { data: cat } = await readMeta(env.BUCKET, metaCat(slug), null);
     if (!cat) return notFound();
-    out.push(davEntry(base, { name: cat.name || slug, mtime: Date.now(), isCollection: true, etag: 'cat-' + slug }));
+    out.push(davEntry(base + '/', { name: cat.name || slug, mtime: Date.now(), isCollection: true, etag: 'cat-' + slug }));
     if (depth !== '0') {
       for (const b of sortBooks(cat.books)) {
         out.push(
@@ -710,6 +718,29 @@ async function apiLogin(req, env) {
 
 const apiLogout = (req) => json({ ok: true }, 200, { 'Set-Cookie': `rb_session=; ${cookieAttrs(req, 0)}` });
 
+/** 导出全库书目清单（书名/分类/大小/上传时间），供本地留存备份。
+ * 每分类 1 次 readMeta：root 1 + 45 = 46 ≤ 50 subrequest 上限。 */
+async function apiExport(env) {
+  const { data: root } = await readMeta(env.BUCKET, META_ROOT, { cats: [] });
+  const cats = (root.cats || []).slice(0, 45);
+  const out = {
+    site: env.SITE_NAME || DEFAULT_SITE,
+    exportedAt: Date.now(),
+    truncated: (root.cats || []).length > 45,
+    totalBooks: cats.reduce((s, c) => s + (Number(c.count) || 0), 0),
+    categories: [],
+  };
+  for (const c of cats) {
+    const { data: cat } = await readMeta(env.BUCKET, metaCat(c.slug), { books: [] });
+    out.categories.push({
+      slug: c.slug,
+      name: cat.name || c.name || c.slug,
+      books: sortBooks(cat.books).map((b) => ({ file: b.file, title: b.title, size: b.size || 0, mtime: b.mtime || 0 })),
+    });
+  }
+  return json(out);
+}
+
 async function apiState(env) {
   const { data: root } = await readMeta(env.BUCKET, META_ROOT, { cats: [] });
   const cats = root.cats || [];
@@ -827,8 +858,8 @@ async function trashBook(env, slug, file) {
 async function apiDelete(req, env) {
   const body = await req.json().catch(() => ({}));
   const slug = safeSeg(body.slug);
-  const file = safeSeg(body.file);
-  if (!slug || !file) return json({ error: '参数不合法' }, 400);
+  const file = body.file;
+  if (!slug || !validFile(file)) return json({ error: '参数不合法' }, 400);
   const r = await trashBook(env, slug, file);
   if (!r.ok) return json({ error: r.error }, r.error === '文件不存在' ? 404 : 400);
   return json({ ok: true, trash: r.trash });
@@ -847,8 +878,8 @@ async function apiBatchDelete(req, env) {
   const results = [];
   for (const it of items) {
     const slug = safeSeg(it && it.slug);
-    const file = safeSeg(it && it.file);
-    if (!slug || !file) {
+    const file = it && it.file;
+    if (!slug || !validFile(file)) {
       results.push({ file, ok: false, error: '参数不合法' });
       continue;
     }
@@ -908,9 +939,9 @@ async function apiMove(req, env) {
   const results = [];
   for (const it of items) {
     const slug = safeSeg(it && it.slug);
-    const file = safeSeg(it && it.file);
+    const file = it && it.file;
     const toSlug = safeSeg(it && it.toSlug);
-    if (!slug || !file || !toSlug) {
+    if (!slug || !validFile(file) || !toSlug) {
       results.push({ file, ok: false, error: '参数不合法' });
       continue;
     }
@@ -947,8 +978,9 @@ async function apiRestore(req, env) {
   const slug = safeSeg(body.slug);
   if (!key.startsWith('_trash/') || !slug) return json({ error: '参数不合法' }, 400);
   // key = _trash/<时间戳>/<分类>/<文件名>，取最后一段为真实文件名（兼容旧格式 _trash/<ts>/<file>）
-  const file = safeSeg(key.slice(key.lastIndexOf('/') + 1));
-  if (!file) return json({ error: '参数不合法' }, 400);
+  // 用原始值 + validFile，保留 rclone 直灌的特殊字符文件名
+  const file = key.slice(key.lastIndexOf('/') + 1);
+  if (!validFile(file)) return json({ error: '参数不合法' }, 400);
 
   const src = await env.BUCKET.get(key);
   if (!src) return json({ error: '回收站里没有这个文件' }, 404);
@@ -1047,6 +1079,7 @@ async function handleApi(req, env, url, p) {
   // SameSite=Lax 下跨站顶级 GET 导航也会带 cookie，方法限制堵住「点链接即改库」的 CSRF 链
   if (p === '/api/logout' && req.method === 'POST') return apiLogout(req);
   if (p === '/api/state' && req.method === 'GET') return apiState(env);
+  if (p === '/api/export' && req.method === 'GET') return apiExport(env);
   if (p === '/api/trash' && req.method === 'GET') return apiTrash(env);
   if (p === '/api/upload' && req.method === 'POST') return apiUpload(req, env, url);
   if (p === '/api/delete' && req.method === 'POST') return apiDelete(req, env);
