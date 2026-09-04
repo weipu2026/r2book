@@ -109,7 +109,6 @@ iOS 1.51+ 另有 OPDS 入口，地址填 `https://你的域名/opds/`。分类�
 浏览器打开域名，用 `ADMIN_PASSWORD` 登录：
 
 - 拖入或选择文件，支持多选，自动显示进度
-- **zip 批量解包上传**：直接拖入 zip，浏览器原生解包后逐本上传（中文文件名按 GBK 转码）；单文件解压上限 30MB 防解压炸弹
 - **GBK 自动转 UTF-8（仅对 txt）**：中文小说 txt 大量是 GBK，浏览器探测后转成 UTF-8 再上传；epub/pdf/mobi 等二进制文件原样上传，不会被转码损坏
 - **书名自动清洗**（可关）：剥掉 `【笔趣阁 www.xxx.com】` 之类广告片段，`《》`书名号和正常括号不受影响
 - **同名查重**：书库里已有同名书时先确认再覆盖，不会静默丢旧版
@@ -143,6 +142,7 @@ iOS 1.51+ 另有 OPDS 入口，地址填 `https://你的域名/opds/`。分类�
 - **GET 支持 Range**，Content-Range 的总长度从分片元数据取，省掉一次额外的 head 请求
 - **列表统一排序**：WebDAV / OPDS / 管理页共用 `Intl.Collator('zh', { numeric: true })` 按书名升序（中文按拼音、数字按数值），三类视图书序一致
 - **WebDAV 只读语义**：集合 href 带结尾斜杠（RFC 4918）；OPTIONS 不回 `MS-Author-Via`，避免客户端误判可写
+- **上传原样放行 zip**：zip 不做解包处理，如需解包请先在电脑上解开再传
 - **文件名原样处理**：删除/移动/恢复按索引里的原始文件名匹配（`validFile` 强校验不含路径分隔符），rclone 直灌的特殊字符文件名也能管理
 - **暴力破解防护**：WebDAV Basic Auth 与上传端登录各自独立计数，同 IP 连错 `BRUTE_LIMIT`（默认 5）次锁 `BRUTE_LOCK_MS`（默认 10 分钟）。纯内存 Map，零额外请求，尽力而为（Workers 多 isolate 不共享计数）；无凭据探测不计入失败，Map 有大小上限防轮换 IP 撑爆内存
 - **OPDS 分页**：分类 feed 每页 `OPDS_PAGE_SIZE`（默认 100）条，`rel="first/previous/next/last"` 链接翻页，页码越界自动夹到最后一页
