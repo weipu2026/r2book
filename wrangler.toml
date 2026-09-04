@@ -46,6 +46,12 @@ MAX_UPLOAD = "52428800"
 # 5MB 绰绰有余，卡小一点防止这个唯一可写区被塞爆 10GB。
 BACKUP_MAX = "5242880"
 
+# 暴力破解防护：连错 BRUTE_LIMIT 次即锁 BRUTE_LOCK_MS 毫秒（默认 5 次 / 10 分钟）
+BRUTE_LIMIT = "5"
+BRUTE_LOCK_MS = "600000"
+# 回收站过期：软删超过 TRASH_TTL_MS 毫秒的文件，在打开回收站时自动清理（默认 30 天）
+TRASH_TTL_MS = "2592000000"
+
 # 以下敏感值用 wrangler secret put 设置，本地开发放 .dev.vars：
 #   ADMIN_PASSWORD   上传端登录口令
 #   SESSION_SECRET   Cookie 的 HMAC 签名密钥（随便一段长随机串）

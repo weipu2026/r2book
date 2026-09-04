@@ -16,7 +16,7 @@
 const META_ROOT = '_meta/root.json';
 const metaCat = (slug) => `_meta/cat/${slug}.json`;
 const bookKey = (slug, file) => `books/${slug}/${file}`;
-const trashKey = (ts, file) => `_trash/${ts}/${file}`;
+const trashKey = (ts, slug, file) => `_trash/${ts}/${slug}/${file}`; // slug 防不同分类同名书碰撞覆盖
 const BACKUP_PREFIX = 'backup/';
 const DEFAULT_SITE = '私人书库';
 
@@ -27,6 +27,14 @@ const BACKUP_MAX_ITEMS = 300; // 条目数上限，防客户端 bug 刷爆 10GB
 /* ---------------- 基础工具 ---------------- */
 
 const nowRfc1123 = (ms) => new Date(ms).toUTCString();
+
+/* 列表统一排序：WebDAV / OPDS / 管理页三类出口共用，书名升序（中文按拼音、数字按数值），
+ * 让手机上看到的书架顺序与管理页一致 */
+const zhCollator = new Intl.Collator('zh', { numeric: true, sensitivity: 'base' });
+const sortBooks = (books) =>
+  (books || [])
+    .slice()
+    .sort((a, b) => zhCollator.compare(String(a.title || a.file), String(b.title || b.file)));
 
 const xmlEsc = (s) =>
   String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' })[c]);
@@ -58,7 +66,7 @@ const notFound = () => new Response('Not Found', { status: 404 });
 const unauthorized = (withChallenge) =>
   new Response('Unauthorized', {
     status: 401,
-    headers: withChallenge ? { 'WWW-Authenticate': 'Basic realm="r2book", charset="UTF-8"' } : {},
+    headers: withChallenge ? { 'WWW-Authenticate': 'Basic realm="Private", charset="UTF-8"' } : {},
   });
 
 /** 去掉路径分隔符、HTML 敏感字符与前置点：既防 R2 key 穿越，也防 slug/file
@@ -121,6 +129,64 @@ async function hmac(secret, msg) {
   for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
   return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
+
+/* ---- 暴力破解防护（尽力而为，纯内存，不产生额外请求） ----
+ * Workers 无服务器，内存 Map 只在单个 isolate 生命周期内持续、不做跨 isolate 共享，
+ * 所以这是把单 IP 弱口令爆破成本抬高到「基本不可行」的近似防护，而非精确计数。
+ * 两个独立作用域：dav（WebDAV/OPDS 的 Basic Auth）与 login（上传端登录）。
+ * 连错 BRUTE_LIMIT 次锁定 BRUTE_LOCK_MS（默认 5 次 / 10 分钟），
+ * 可用环境变量 BRUTE_LIMIT / BRUTE_LOCK_MS 覆盖。
+ */
+const BRUTE = new Map();
+const BRUTE_MAX = 10000; // 防攻击者轮换 IP 把 Map 撑爆内存
+/** Map 超限时先清已过期条目，仍超再逐出「最早锁定」的一个 */
+const brutePrune = () => {
+  if (BRUTE.size < BRUTE_MAX) return;
+  const now = Date.now();
+  for (const [k, rec] of BRUTE) {
+    if (rec.until <= now) BRUTE.delete(k);
+    if (BRUTE.size < BRUTE_MAX) break;
+  }
+  let oldestKey = null;
+  let oldest = Infinity;
+  for (const [k, rec] of BRUTE) {
+    if (rec.until < oldest) {
+      oldest = rec.until;
+      oldestKey = k;
+    }
+  }
+  if (oldestKey) BRUTE.delete(oldestKey);
+};
+const bruteCfg = (env) => ({
+  limit: Number(env.BRUTE_LIMIT) || 5,
+  lockMs: Number(env.BRUTE_LOCK_MS) || 10 * 60 * 1000,
+});
+const clientIp = (req) => req.headers.get('CF-Connecting-IP') || 'unknown'; // 只信 CF 注入头，xff 可伪造
+const bruteKey = (scope, ip) => `${scope}:${ip}`;
+const bruteLocked = (req, env, scope) => {
+  const rec = BRUTE.get(bruteKey(scope, clientIp(req)));
+  return !!rec && rec.until > Date.now();
+};
+const bruteFail = (req, env, scope) => {
+  brutePrune();
+  const cfg = bruteCfg(env);
+  const key = bruteKey(scope, clientIp(req));
+  const now = Date.now();
+  const rec = BRUTE.get(key) || { fail: 0, until: 0 };
+  // 只有「曾经锁定且已过期」才重置计数；否则（未锁定状态）直接累加，
+  // 否则 fail 每次都被归零，永远到不了阈值，防护等于没装
+  if (rec.until > 0 && rec.until <= now) {
+    rec.fail = 0;
+    rec.until = 0;
+  }
+  rec.fail += 1;
+  if (rec.fail >= cfg.limit) {
+    rec.until = now + cfg.lockMs;
+    rec.fail = 0;
+  }
+  BRUTE.set(key, rec);
+};
+const bruteClear = (req, env, scope) => BRUTE.delete(bruteKey(scope, clientIp(req)));
 
 /* ---------------- 鉴权 ---------------- */
 
@@ -296,7 +362,7 @@ async function propfind(req, env, p) {
     if (!cat) return notFound();
     out.push(davEntry(base, { name: cat.name || slug, mtime: Date.now(), isCollection: true, etag: 'cat-' + slug }));
     if (depth !== '0') {
-      for (const b of cat.books || []) {
+      for (const b of sortBooks(cat.books)) {
         out.push(
           davEntry(`/books/${slug}/${b.file}`, {
             name: b.title || b.file,
@@ -342,7 +408,7 @@ function parseRange(h) {
   const s = m[1];
   const e = m[2];
   if (s === '' && e === '') return 'invalid';
-  if (s === '') return { suffix: Number(e) };
+  if (s === '') return Number(e) > 0 ? { suffix: Number(e) } : 'invalid'; // bytes=-0 无意义
   if (e === '') return { offset: Number(s) };
   const start = Number(s);
   const end = Number(e);
@@ -369,7 +435,7 @@ async function getFile(req, env, p, head) {
   headers.set('Content-Type', contentType(file));
   headers.set('Accept-Ranges', 'bytes');
   headers.set('ETag', `"${obj.etag}"`);
-  headers.set('Cache-Control', 'private, max-age=3600');
+  headers.set('Cache-Control', 'no-store'); // 私密书库：禁止浏览器缓存正文
   headers.set('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(file)}`);
 
   let status = 200;
@@ -379,6 +445,7 @@ async function getFile(req, env, p, head) {
     const rec = (cat.books || []).find((x) => x.file === file);
     const total = rec ? Number(rec.size) || obj.size : obj.size;
     const start = rangeOpt.suffix ? Math.max(0, total - rangeOpt.suffix) : rangeOpt.offset || 0;
+    if (start >= total) return new Response(null, { status: 416, headers: { 'Content-Range': `bytes */${total}` } });
     headers.set('Content-Range', `bytes ${start}-${start + obj.size - 1}/${total}`);
     headers.set('Content-Length', String(obj.size));
     status = 206;
@@ -532,13 +599,31 @@ async function opdsRoot(req, env) {
   return xml(out.join(''));
 }
 
+/** 分类 feed 分页：OPDS 规范用 rel="first/previous/next/last" 链接翻页，
+ * 大书架在 iOS Readingo 里也流畅；默认每页 100，可用 OPDS_PAGE_SIZE 调。 */
+const OPDS_PAGE_SIZE = 100;
+
 async function opdsCat(req, env, slug) {
   const origin = new URL(req.url).origin;
   const site = env.SITE_NAME || DEFAULT_SITE;
+  const url = new URL(req.url);
+  const page = Math.max(1, Math.floor(Number(url.searchParams.get('page') || 1)) || 1);
   const { data: cat } = await readMeta(env.BUCKET, metaCat(slug), null);
   if (!cat) return notFound();
+  const all = sortBooks(cat.books);
+  const pages = Math.max(1, Math.ceil(all.length / OPDS_PAGE_SIZE));
+  const cur = Math.min(page, pages); // 页码夹紧：越界落到最后一页，而不是返回空 feed
+  const slice = all.slice((cur - 1) * OPDS_PAGE_SIZE, cur * OPDS_PAGE_SIZE);
+
   const out = [feedHeader(origin, `/opds/${slug}.xml`, `${site} · ${cat.name || slug}`, ACQ_TYPE)];
-  for (const b of cat.books || []) out.push(acqEntry(origin, slug, b));
+  const catRef = (n) => encPath(`/opds/${slug}.xml`) + `?page=${n}`;
+  if (cur > 1) {
+    out.push(`<link rel="first" href="${origin}${catRef(1)}" type="${ACQ_TYPE}"/>`);
+    out.push(`<link rel="previous" href="${origin}${catRef(cur - 1)}" type="${ACQ_TYPE}"/>`);
+  }
+  if (cur < pages) out.push(`<link rel="next" href="${origin}${catRef(cur + 1)}" type="${ACQ_TYPE}"/>`);
+  if (pages > 1) out.push(`<link rel="last" href="${origin}${catRef(pages)}" type="${ACQ_TYPE}"/>`);
+  for (const b of slice) out.push(acqEntry(origin, slug, b));
   out.push('</feed>');
   return xml(out.join(''));
 }
@@ -551,10 +636,14 @@ async function opdsSearch(req, env, q) {
   if (key) {
     const { data: root } = await readMeta(env.BUCKET, META_ROOT, { cats: [] });
     let hits = 0;
-    // 每个分类 1 次 readMeta，Workers Free 单次 50 subrequest：root 1 + 40 = 41，留余量
-    for (const c of (root.cats || []).slice(0, 40)) {
-      if (hits >= 50) break;
+    let scanned = 0;
+    // CPU 预算控制：搜索要解析分类 JSON（实测约 0.8ms/千本）。限「解析分类 ≤20
+    // （subrequest root+20=21 有余量）且累计扫描本数 ≤10000（约 8ms）」，
+    // 超出即止，避免顶到 Free 计划 10ms CPU 硬限——hits 只截输出、不省解析。
+    for (const c of (root.cats || []).slice(0, 20)) {
+      if (scanned >= 10000) break;
       const { data: cat } = await readMeta(env.BUCKET, metaCat(c.slug), { books: [] });
+      scanned += (cat.books || []).length;
       for (const b of cat.books || []) {
         if (String(b.title || b.file).toLowerCase().includes(key)) {
           out.push(acqEntry(origin, c.slug, b));
@@ -600,11 +689,16 @@ function cookieAttrs(req, maxAge) {
 }
 
 async function apiLogin(req, env) {
+  if (bruteLocked(req, env, 'login')) return new Response('Too Many Requests', { status: 429 });
   const body = await req.json().catch(() => ({}));
   const pass = String(body.password || '');
   const admin = env.ADMIN_PASSWORD;
-  if (!admin) return json({ error: '服务端未配置 ADMIN_PASSWORD' }, 500);
-  if (!safeEqual(pass, admin)) return json({ error: '口令错误' }, 401);
+  if (!admin) return json({ error: '口令错误' }, 401); // 配置缺失与口令错误同码，避免暴露部署状态
+  if (!safeEqual(pass, admin)) {
+    bruteFail(req, env, 'login');
+    return json({ error: '口令错误' }, 401);
+  }
+  bruteClear(req, env, 'login');
 
   const days = Number(env.SESSION_DAYS || 30) || 30;
   const payload = b64url(JSON.stringify({ exp: Date.now() + days * 86400000 }));
@@ -631,8 +725,7 @@ async function apiState(env) {
 async function apiCatGet(env, slug) {
   const { data: cat } = await readMeta(env.BUCKET, metaCat(slug), null);
   if (!cat) return json({ error: '分类不存在' }, 404);
-  const books = (cat.books || []).slice().sort((a, b) => (b.mtime || 0) - (a.mtime || 0));
-  return json({ slug, name: cat.name || slug, books });
+  return json({ slug, name: cat.name || slug, books: sortBooks(cat.books) });
 }
 
 async function apiCatUpsert(req, env) {
@@ -697,7 +790,15 @@ async function apiUpload(req, env, url) {
     else cat.books.push(rec);
     return cat;
   });
-  if (!ok) return json({ error: '索引写入冲突，请重试' }, 409);
+  if (!ok) {
+    // 索引写失败：新增场景回滚刚写的对象，不留幽灵文件占配额；
+    // 覆盖场景保留对象（旧版已被覆盖无法找回），提示重建索引
+    if (!dup) await env.BUCKET.delete(bookKey(slug, file));
+    return json(
+      { error: dup ? '索引写入冲突，请稍后重试；如文件已覆盖请重建索引' : '索引写入冲突，本次上传已回滚，请重试' },
+      409
+    );
+  }
 
   await syncCatToRoot(env, slug, catName || undefined);
   return json({ ok: true, size: body.byteLength });
@@ -710,7 +811,7 @@ async function trashBook(env, slug, file) {
   if (!src) return { file, ok: false, error: '文件不存在' };
 
   const ts = Date.now();
-  await env.BUCKET.put(trashKey(ts, file), await src.arrayBuffer(), { httpMetadata: { contentType: contentType(file) } });
+  await env.BUCKET.put(trashKey(ts, slug, file), await src.arrayBuffer(), { httpMetadata: { contentType: contentType(file) } });
   await env.BUCKET.delete(key);
 
   const updated = await updateCat(env, slug, (cat) => {
@@ -720,7 +821,7 @@ async function trashBook(env, slug, file) {
   // 文件已进回收站但索引没改成：不能报 ok，否则客户端看到的是「删好了」的幽灵索引
   if (!updated) return { file, ok: false, error: '索引写入冲突，文件已进回收站，请重建索引后恢复' };
   await syncCatToRoot(env, slug);
-  return { file, ok: true, trash: trashKey(ts, file) };
+  return { file, ok: true, trash: trashKey(ts, slug, file) };
 }
 
 async function apiDelete(req, env) {
@@ -818,10 +919,26 @@ async function apiMove(req, env) {
   return json({ results });
 }
 
+/** 回收站列表 + 惰性过期清理。
+ * key 自带软删时间戳（_trash/<ts>/<file>），所以打开回收站时顺手删掉超期对象即可——
+ * 不加任何定时任务、不产生额外请求。单次最多清 45 个（list 1 次 + delete 45 次 < 50-subrequest
+ * 上限），没删完的留到下一次打开时再清。过期时长用 TRASH_TTL_MS 调（默认 30 天）。 */
 async function apiTrash(env) {
   const list = await env.BUCKET.list({ prefix: '_trash/' });
-  const items = list.objects.map((o) => ({ key: o.key, size: o.size, uploaded: o.uploaded ? o.uploaded.getTime() : 0 }));
-  return json({ items });
+  const objects = list.objects;
+  const ttl = Number(env.TRASH_TTL_MS) || 30 * 86400000;
+  const now = Date.now();
+  const expired = objects.filter((o) => {
+    const ts = Number(o.key.slice('_trash/'.length).split('/')[0]);
+    return Number.isFinite(ts) && now - ts > ttl;
+  });
+  const doomed = expired.slice(0, 45);
+  for (const o of doomed) await env.BUCKET.delete(o.key);
+  const doomedKeys = new Set(doomed.map((o) => o.key));
+  const items = objects
+    .filter((o) => !doomedKeys.has(o.key))
+    .map((o) => ({ key: o.key, size: o.size, uploaded: o.uploaded ? o.uploaded.getTime() : 0 }));
+  return json({ items, purged: doomed.length });
 }
 
 async function apiRestore(req, env) {
@@ -829,10 +946,8 @@ async function apiRestore(req, env) {
   const key = String(body.key || '');
   const slug = safeSeg(body.slug);
   if (!key.startsWith('_trash/') || !slug) return json({ error: '参数不合法' }, 400);
-  // key 形如 _trash/<时间戳>/<文件名>，跳过时间戳取真实文件名
-  const rest = key.slice('_trash/'.length);
-  const slash = rest.indexOf('/');
-  const file = safeSeg(slash >= 0 ? rest.slice(slash + 1) : rest);
+  // key = _trash/<时间戳>/<分类>/<文件名>，取最后一段为真实文件名（兼容旧格式 _trash/<ts>/<file>）
+  const file = safeSeg(key.slice(key.lastIndexOf('/') + 1));
   if (!file) return json({ error: '参数不合法' }, 400);
 
   const src = await env.BUCKET.get(key);
@@ -848,13 +963,14 @@ async function apiRestore(req, env) {
   await env.BUCKET.put(bookKey(slug, file), buf, { httpMetadata: { contentType: contentType(file) } });
   await env.BUCKET.delete(key);
 
-  await updateCat(env, slug, (cat) => {
+  const ok = await updateCat(env, slug, (cat) => {
     if (!Array.isArray(cat.books)) cat.books = [];
     if (!cat.books.some((b) => b.file === file)) {
       cat.books.push({ file, title: titleOf(file), size: buf.byteLength, mtime: Date.now() });
     }
     return cat;
   });
+  if (!ok) return json({ error: '索引写入冲突，文件已恢复但书目未登记，请重建索引', recovered: true }, 409);
   await syncCatToRoot(env, slug);
   return json({ ok: true });
 }
@@ -902,6 +1018,8 @@ async function apiRebuild(req, env) {
   const books = [];
   let cursor;
   let rounds = 0;
+  // 每页 1000 本，最多读 45 页（45000 本）——比原来 5 页（5000 本）不再截断小库；
+  // 真超 45000 本则明确报错而不是写截断索引（对象仍在 R2，避免索引与实物脱节）
   do {
     const r = await env.BUCKET.list({ prefix, cursor });
     for (const o of r.objects) {
@@ -911,7 +1029,8 @@ async function apiRebuild(req, env) {
     }
     cursor = r.truncated ? r.cursor : undefined;
     rounds++;
-  } while (cursor && rounds < 5);
+  } while (cursor && rounds < 45);
+  if (cursor) return json({ error: `分类「${next}」超过 45000 本，无法一次重建，请拆分后再试` }, 409);
 
   const { data: cat } = await readMeta(env.BUCKET, metaCat(next), { books: [] });
   await putMeta(env.BUCKET, metaCat(next), { name: (cat && cat.name) || next, books }, null);
@@ -924,18 +1043,20 @@ async function handleApi(req, env, url, p) {
   if (p === '/api/login') return req.method === 'POST' ? apiLogin(req, env) : json({ error: 'method' }, 405);
   if (!(await verifyCookie(req, env))) return json({ error: 'unauthorized' }, 401);
 
-  if (p === '/api/logout') return apiLogout(req);
-  if (p === '/api/state') return apiState(env);
-  if (p === '/api/trash') return apiTrash(env);
-  if (p === '/api/upload') return apiUpload(req, env, url);
-  if (p === '/api/delete') return apiDelete(req, env);
+  // 全部限方法：改数据接口只认 POST/DELETE，GET 一律 405。
+  // SameSite=Lax 下跨站顶级 GET 导航也会带 cookie，方法限制堵住「点链接即改库」的 CSRF 链
+  if (p === '/api/logout' && req.method === 'POST') return apiLogout(req);
+  if (p === '/api/state' && req.method === 'GET') return apiState(env);
+  if (p === '/api/trash' && req.method === 'GET') return apiTrash(env);
+  if (p === '/api/upload' && req.method === 'POST') return apiUpload(req, env, url);
+  if (p === '/api/delete' && req.method === 'POST') return apiDelete(req, env);
   if (p === '/api/batch-delete' && req.method === 'POST') return apiBatchDelete(req, env);
   if (p === '/api/move' && req.method === 'POST') return apiMove(req, env);
-  if (p === '/api/restore') return apiRestore(req, env);
-  if (p === '/api/purge') return apiPurge(req, env);
+  if (p === '/api/restore' && req.method === 'POST') return apiRestore(req, env);
+  if (p === '/api/purge' && req.method === 'POST') return apiPurge(req, env);
   if (p === '/api/cat' && req.method === 'POST') return apiCatUpsert(req, env);
   if (p === '/api/cat' && req.method === 'DELETE') return apiCatDelete(req, env);
-  if (p === '/api/rebuild') return apiRebuild(req, env);
+  if (p === '/api/rebuild' && req.method === 'POST') return apiRebuild(req, env);
 
   const m = /^\/api\/cat\/(.+)$/.exec(p);
   // pathname 保留百分号编码，前端 encodeURIComponent 过的中文 slug 必须先解码，
@@ -959,7 +1080,18 @@ export default {
       return env.ASSETS.fetch(req);
     }
 
-    const authed = (await verifyCookie(req, env)) || verifyBasic(req, env);
+    // 鉴权门：cookie（管理端）优先；无 cookie 才走 Basic Auth（手机），并对连续失败计数锁定
+    let authed = await verifyCookie(req, env);
+    if (!authed) {
+      if (bruteLocked(req, env, 'dav')) return new Response('Too Many Requests', { status: 429 });
+      authed = verifyBasic(req, env);
+      if (authed) {
+        bruteClear(req, env, 'dav'); // 一次成功即清空失败记录，正常用户偶发手误不记账
+      } else if (req.headers.get('Authorization')) {
+        // 只统计「确实带着凭据但密码错误」的请求；无凭据探测不计入失败
+        bruteFail(req, env, 'dav');
+      }
+    }
 
     if (p.startsWith('/opds')) {
       if (!authed) return unauthorized(true);

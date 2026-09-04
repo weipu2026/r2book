@@ -394,6 +394,10 @@ function queueRow(name) {
 
 const WORD_EXT = /\.(docx?|wps|rtf|odt)$/i;
 
+/* 只有纯文本才需要 GBK→UTF-8 转码；epub/pdf/mobi 等是二进制，
+ * 转码会把它当成乱码文本重编码导致文件损坏，必须原样上传 */
+const TEXT_EXT = /\.(txt|text)$/i;
+
 /* 书名清洗：剥掉中英文括号里带广告特征词的片段，保留《》书名号与正常括号 */
 const AD_BRACKET =
   /[【\[(（][^【】\[\]（）()]*?(?:www\s?\.|https?:\/\/|\.(?:com|net|cc|org|info|top|xyz)\b|小说|文学|首发|手打|笔趣|书城|阅读网|更新最快|无弹窗|全文阅读|免费阅|书友|交流群)[^【】\[\]（）()]*?[】\])）]/gi;
@@ -433,10 +437,15 @@ async function handleFiles(fileList) {
     const row = queueRow(fname !== f.name ? `${f.name} → ${fname}` : f.name);
     try {
       const buf = await f.arrayBuffer();
-      row.note('转码中');
-      const { text, enc } = decodeNovel(buf);
-      const out = new TextEncoder().encode(text);
-      row.note(enc === 'gbk' ? 'GBK → UTF-8' : enc);
+      let out = buf;
+      if (TEXT_EXT.test(fname)) {
+        row.note('转码中');
+        const { text, enc } = decodeNovel(buf);
+        out = new TextEncoder().encode(text);
+        row.note(enc === 'gbk' ? 'GBK → UTF-8' : enc);
+      } else {
+        row.note('原样上传');
+      }
       const url = `/api/upload?cat=${encodeURIComponent(slug)}&catName=${encodeURIComponent(catName)}&file=${encodeURIComponent(fname)}`;
       let res;
       try {
@@ -484,12 +493,14 @@ async function deleteBook(b) {
   }
 }
 
+let trashItems = [];
+
 async function loadTrash() {
   const box = $('#trash-body');
   box.innerHTML = '加载中…';
   try {
     const r = await api('/api/trash');
-    const items = r.items || [];
+    const items = trashItems = r.items || [];
     $('#trash-count').textContent = items.length ? `(${items.length})` : '';
     box.innerHTML = '';
     if (!items.length) {
@@ -536,6 +547,29 @@ async function loadTrash() {
     }
   } catch (e) {
     box.textContent = '加载失败：' + e.message; // 不走 innerHTML，防错误消息带 HTML
+  }
+}
+
+/* 清空回收站：复用 /api/purge，按 40 个 key 一批循环，不占新接口 */
+async function clearTrash() {
+  if (!trashItems.length) { toast('回收站是空的'); return; }
+  if (!confirm(`彻底删除回收站里全部 ${trashItems.length} 个文件？此操作不可撤销。`)) return;
+  let done = 0;
+  try {
+    const keys = trashItems.map((it) => it.key);
+    for (let i = 0; i < keys.length; i += 40) {
+      const r = await api('/api/purge', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ keys: keys.slice(i, i + 40) }),
+      });
+      done += Number(r && r.purged) || 0;
+    }
+    await loadState();
+    await loadTrash();
+    toast(`已彻底删除 ${done} 个文件`);
+  } catch (e) {
+    toast(e.message);
   }
 }
 
@@ -618,6 +652,16 @@ function bind() {
   document.querySelector('.trash-box').addEventListener('toggle', (e) => {
     if (e.target.open) loadTrash();
   });
+
+  // summary 里的「清空」按钮：先阻止折叠展开，再执行清理
+  const clearBtn = $('#btn-trash-clear');
+  if (clearBtn) {
+    clearBtn.onclick = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      clearTrash();
+    };
+  }
 
   $('#login-form').onsubmit = async (e) => {
     e.preventDefault();
